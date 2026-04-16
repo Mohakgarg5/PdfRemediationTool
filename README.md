@@ -1,172 +1,200 @@
-# PDF Remediation Tool
+# VAPT - PDF Accessibility Remediation Pipeline
 
-> Automatically transform any PDF into a **PDF/UA-1 compliant**, fully accessible document — passing PAC and veraPDF validation out of the box.
+[![GitHub](https://img.shields.io/badge/GitHub-Mohakgarg5%2FPdfRemediationTool-blue)](https://github.com/Mohakgarg5/PdfRemediationTool)
+
+> Automatically transform any PDF into a **PDF/UA-1 (ISO 14289-1) compliant**, fully accessible document - passing **PAC 2024** and **veraPDF** validation out of the box.
 
 ---
 
-## Overview
+## The Problem
 
-**PdfRemediationTool** is a Python pipeline that takes ordinary PDFs and applies a four-stage remediation process to make them conform to the **PDF/UA-1** (ISO 14289-1) accessibility standard. It handles structure tagging, metadata injection, font embedding, link annotation wiring, and full validation — with both a command-line interface and a Streamlit web UI.
+Organizations are legally required to make their digital documents accessible (ADA, Section 508, EN 301 549, EAA 2025). Manually remediating PDFs for accessibility is expensive, slow, and error-prone - a single document can take hours of specialist work.
 
-### What it fixes
+## The Solution
 
-| Issue | How it's handled |
+**VAPT** is an automated pipeline that takes ordinary PDFs and applies a four-stage remediation process to produce fully accessible PDF/UA-1 documents. It handles structure tagging, metadata injection, font embedding, link annotation wiring, and validation - with both a **CLI** and a **Streamlit web UI**.
+
+### What It Fixes
+
+| Accessibility Issue | How It's Handled |
 |---|---|
-| Missing structure tags | Injects `/Document`, `/P`, `/H1`–`/H6`, `/Figure`, `/Table`, `/TR`, `/TD`, `/L`, `/LI` |
-| Untagged images | Adds `/Figure` with `/Alt` text and `/BBox` layout attributes |
-| Missing XMP metadata | Writes `dc:title`, `dc:language`, `pdf:Producer`, `pdfuaid:part` |
-| Unembedded fonts | Locates and embeds font files without disturbing existing metrics |
-| Missing `MarkInfo` | Sets `/Marked true` and `/Suspects false` |
-| Tab order & ViewerPrefs | Sets `/TabOrder /S` on all pages and `DisplayDocTitle true` |
-| Broken link annotations | Wires `/Link` structure elements with both MCR (text) and OBJR (annotation ref) |
-| Watermarks / headers / footers | Tagged as `/Artifact` so they are invisible to screen readers |
+| Missing structure tags | Injects `/Document`, `/P`, `/H1`-`/H6`, `/Figure`, `/Table`, `/TR`, `/TD`, `/L`, `/LI` |
+| Untagged images | Adds `/Figure` elements with `/Alt` text, `/BBox`, and `/Placement` layout attributes |
+| Missing XMP metadata | Writes `dc:title`, `dc:language`, `pdfuaid:part=1`, `pdf:Producer` |
+| Unembedded fonts | Locates system TTF files, subsets to used glyphs, embeds without altering existing metrics |
+| Missing MarkInfo | Sets `/Marked true` and `/Suspects false` |
+| Tab order & ViewerPrefs | Sets `/Tabs /S` on all pages and `/DisplayDocTitle true` |
+| Broken link annotations | Wires `/Link` structure elements with both MCR (text content ref) and OBJR (annotation ref) |
+| Watermarks / headers / footers | Detected and tagged as `/Artifact` so screen readers skip them |
+| Missing ToUnicode CMap | Generates Windows-1252 CMap for proper text extraction |
+| CIDFont issues | Adds `/CIDToGIDMap /Identity`, removes invalid CIDSet streams |
 
 ---
 
 ## Architecture
 
 ```
-input PDF
-    │
-    ▼
-┌──────────────────┐
-│  pdf_extractor   │  Stage 1 — Content extraction & classification
-│                  │  • Parses text blocks, font metrics, bounding boxes
-│                  │  • Detects headings (by font-size ratio), lists, tables
-│                  │  • Identifies watermarks, headers, footers as artifacts
-└────────┬─────────┘
-         │ DocumentContent (dataclass graph)
-         ▼
-┌──────────────────┐
-│   pdf_tagger     │  Stage 2 — Structure tag injection
-│                  │  • Writes PDF structure tree directly into the file
-│                  │  • Marks content streams with MCID markers
-│                  │  • Builds ParentTree, RoleMap, ClassMap
-│                  │  • Handles Link annotation tagging (MCR + OBJR)
-└────────┬─────────┘
-         │ tagged PDF
-         ▼
-┌──────────────────┐
-│ pdf_postprocess  │  Stage 3 — Metadata & font post-processing
-│                  │  • XMP metadata (pdfuaid, dc, pdf namespaces)
-│                  │  • MarkInfo, ViewerPreferences, TabOrder
-│                  │  • Font embedding (preserves original descriptor metrics)
-│                  │  • Type0 / CIDFont descendant handling
-└────────┬─────────┘
-         │ remediated PDF
-         ▼
-┌──────────────────┐
-│   validator      │  Stage 4 — veraPDF / PAC validation
-│                  │  • Runs veraPDF CLI with PDF/UA-1 profile
-│                  │  • Parses JSON report, surfaces failed clauses
-└──────────────────┘
-         │
-         ▼
-    output PDF  ✓ PDF/UA-1 compliant
-```
-
----
-
-## Requirements
-
-| Dependency | Version | Purpose |
-|---|---|---|
-| Python | ≥ 3.10 | Runtime |
-| [pikepdf](https://pikepdf.readthedocs.io/) | ≥ 8 | Low-level PDF read/write |
-| [pdfminer.six](https://pdfminersix.readthedocs.io/) | ≥ 20221105 | Text extraction |
-| [Pillow](https://python-pillow.org/) | ≥ 10 | Image handling |
-| [streamlit](https://streamlit.io/) | ≥ 1.30 | Web UI (optional) |
-| [veraPDF](https://verapdf.org/software/) | ≥ 1.24 | PDF/UA-1 validation (Java) |
-
-Install Python dependencies:
-
-```bash
-pip install pikepdf pdfminer.six Pillow streamlit
-```
-
-Install veraPDF (Java required):
-
-```bash
-# macOS (Homebrew)
-brew install verapdf
-
-# Linux / manual
-# Download installer from https://verapdf.org/software/
-java -jar verapdf-installer.jar
+Input PDF
+    |
+    v
++--------------------+
+|  pdf_extractor.py  |  Stage 1 - Content Extraction & Classification
+|                    |  Parses text, fonts, images, bounding boxes
+|                    |  Detects headings, lists, tables, watermarks, headers/footers
++--------+-----------+
+         | DocumentContent (dataclass graph)
+         v
++--------------------+
+|   pdf_tagger.py    |  Stage 2 - Structure Tag Injection
+|                    |  Rewrites content streams with BDC/EMC markers
+|                    |  Builds StructTreeRoot, ParentTree, RoleMap
+|                    |  Handles link annotations (MCR + OBJR)
++--------+-----------+
+         | Tagged PDF
+         v
++--------------------+
+| pdf_postprocess.py |  Stage 3 - Metadata & Font Post-Processing
+|                    |  XMP metadata, MarkInfo, ViewerPreferences
+|                    |  Font embedding with metric preservation
+|                    |  CIDFont fixes, annotation tagging, cleanup
++--------+-----------+
+         | Remediated PDF
+         v
++--------------------+
+|   validator.py     |  Stage 4 - veraPDF Validation (optional)
+|                    |  Runs veraPDF CLI with PDF/UA-1 profile
+|                    |  Parses JSON report, surfaces failing clauses
++--------------------+
+         |
+         v
+    Output PDF  --> <original>_accessible.pdf
 ```
 
 ---
 
 ## Quick Start
 
-### CLI
+### Prerequisites
+
+| Dependency | Version | Required | Purpose |
+|---|---|---|---|
+| Python | >= 3.10 | Yes | Runtime |
+| [pikepdf](https://pikepdf.readthedocs.io/) | >= 8 | Yes | Low-level PDF manipulation |
+| [pdfminer.six](https://pdfminersix.readthedocs.io/) | >= 20221105 | Yes | Text extraction with font metrics |
+| [Pillow](https://python-pillow.org/) | >= 10 | Yes | Image processing |
+| [fonttools](https://github.com/fonttools/fonttools) | >= 4.0 | Yes | TTF subsetting for font embedding |
+| [langdetect](https://github.com/Mimino666/langdetect) | >= 1.0.9 | Yes | Document language detection |
+| [streamlit](https://streamlit.io/) | >= 1.30 | For Web UI | Web interface |
+| [veraPDF](https://verapdf.org/software/) | >= 1.24 | For validation | PDF/UA-1 validation (Java) |
+
+### Installation
 
 ```bash
-# Process all PDFs in the input/ directory
+# Clone the repo
+git clone https://github.com/Mohakgarg5/PdfRemediationTool.git
+cd PdfRemediationTool
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+**Optional - Install veraPDF** (for validation stage):
+```bash
+# macOS
+brew install verapdf
+
+# Linux - download from https://verapdf.org/software/
+java -jar verapdf-installer.jar
+```
+
+### Usage
+
+#### CLI
+
+```bash
+# Process all PDFs in input/ directory
 python main.py
 
 # Process a single file
 python main.py --input report.pdf
 
-# Specify custom directories
+# Custom directories
 python main.py --input-dir docs/ --output-dir accessible_docs/
 
-# Skip veraPDF validation step
+# Skip veraPDF validation (no Java needed)
 python main.py --skip-validation
 
-# Enable verbose/debug logging
+# Debug logging
 python main.py --verbose
 ```
 
 Output files are written as `<original_name>_accessible.pdf` in the output directory.
 
-### Web UI (Streamlit)
+#### Web UI (Streamlit)
 
 ```bash
 streamlit run app.py
 ```
 
-Open `http://localhost:8501` in your browser, drag and drop PDFs, and download the remediated files.
+Open `http://localhost:8501` - drag and drop PDFs, process, and download remediated files.
+
+#### Shell Script
+
+```bash
+chmod +x run.sh
+./run.sh                       # Process all PDFs in input/
+./run.sh --input file.pdf      # Single file
+./run.sh --skip-validation     # Skip veraPDF
+```
 
 ---
 
 ## Project Structure
 
 ```
-PdfRemediationTool/
-├── main.py            # CLI entry point & pipeline orchestrator
-├── app.py             # Streamlit web UI
-├── pdf_extractor.py   # Stage 1: content extraction & classification
-├── pdf_tagger.py      # Stage 2: structure tag injection
-├── pdf_postprocess.py # Stage 3: metadata, fonts, annotations
-├── validator.py       # Stage 4: veraPDF integration
-├── models.py          # Shared dataclasses (DocumentContent, TextBlock, …)
-├── config.py          # Tunable constants (heading ratios, zone sizes, …)
-├── input/             # Drop source PDFs here (CLI mode)
-└── output/            # Remediated PDFs written here (CLI mode)
+vapt/
+|-- main.py              # CLI entry point & pipeline orchestrator
+|-- app.py               # Streamlit web UI
+|-- pdf_extractor.py     # Stage 1: content extraction & classification (839 lines)
+|-- pdf_tagger.py        # Stage 2: structure tag injection (1,096 lines)
+|-- pdf_postprocess.py   # Stage 3: metadata, fonts, annotations (1,002 lines)
+|-- validator.py         # Stage 4: veraPDF integration (201 lines)
+|-- models.py            # Shared dataclasses (DocumentContent, TextBlock, BBox, etc.)
+|-- config.py            # Tunable constants (heading ratios, zone sizes, etc.)
+|-- requirements.txt     # Python dependencies
+|-- packages.txt         # System packages for Streamlit Cloud (fonts-liberation)
+|-- run.sh               # CLI convenience wrapper
+|-- input/               # Drop source PDFs here (CLI mode)
+|-- output/              # Remediated PDFs appear here
+|-- report/              # veraPDF validation reports
 ```
 
 ---
 
 ## Configuration
 
-Edit `config.py` to tune detection thresholds:
+All tunable constants live in `config.py`:
 
 ```python
-# Heading detection — ratio of element font size to body text size
-HEADING_SIZE_RATIO_H1 = 1.8
-HEADING_SIZE_RATIO_H2 = 1.5
-HEADING_SIZE_RATIO_H3 = 1.25
-HEADING_SIZE_RATIO_H4 = 1.1
+# Heading detection - ratio of font size to body text
+HEADING_SIZE_RATIO_H1 = 1.8    # >= 1.8x body = H1
+HEADING_SIZE_RATIO_H2 = 1.5    # >= 1.5x body = H2
+HEADING_SIZE_RATIO_H3 = 1.25   # >= 1.25x body = H3
+HEADING_SIZE_RATIO_H4 = 1.1    # >= 1.1x body = H4 (must also be bold)
 
-# Header / footer zone (fraction of page height from top/bottom)
-HEADER_ZONE_FRACTION = 0.08
-FOOTER_ZONE_FRACTION = 0.08
+# Header/footer zones (fraction of page height)
+HEADER_ZONE_FRACTION = 0.08    # Top 8%
+FOOTER_ZONE_FRACTION = 0.08    # Bottom 8%
 
 # Watermark detection
-WATERMARK_MIN_ROTATION   = 15.0
-WATERMARK_MAX_ROTATION   = 75.0
-WATERMARK_MIN_FONT_SIZE  = 36.0
+WATERMARK_MIN_ROTATION = 15.0       # degrees
+WATERMARK_MAX_ROTATION = 75.0       # degrees
+WATERMARK_MIN_FONT_SIZE = 36.0      # points
+WATERMARK_LIGHT_COLOR_THRESHOLD = 0.7  # 0=black, 1=white
 
 # veraPDF profile
 VERAPDF_PROFILE = "ua1"
@@ -176,49 +204,69 @@ VERAPDF_PROFILE = "ua1"
 
 ## Compliance Standards
 
-The tool targets **PDF/UA-1 (ISO 14289-1)** compliance as measured by:
+**Target:** PDF/UA-1 (ISO 14289-1)
 
-- **PAC** (PDF Accessibility Checker) — Swiss PDF Association checker
-- **veraPDF** — industry-standard open-source PDF/UA validator
+**Validated by:**
+- **PAC 2024** (PDF Accessibility Checker) - Swiss PDF Association
+- **veraPDF** - Industry-standard open-source validator
 
-Key Matterhorn Protocol checkpoints addressed:
+**Matterhorn Protocol checkpoints addressed:**
 
-- `01-004` — Tagged PDF flag set (`MarkInfo /Marked true`)
-- `01-006` — Link elements contain both MCR and OBJR children
-- `06-001` — Document language specified (`/Lang`)
-- `07-001` — Natural language identified in metadata
-- `09-004` — `/Figure` elements have `/Alt` text
-- `14-002` — Artifacts correctly marked
-- `28-002` — XMP metadata includes `pdfuaid:part = 1`
-
----
-
-## How Heading Detection Works
-
-The extractor computes a **body text size baseline** (median font size across the page) and classifies spans whose font size exceeds it by a configurable ratio:
-
-| Ratio | Assigned tag |
+| Clause | Requirement |
 |---|---|
-| ≥ 1.8× body | `/H1` |
-| ≥ 1.5× body | `/H2` |
-| ≥ 1.25× body | `/H3` |
-| ≥ 1.1× body | `/H4` |
-| Bold at body size | `/H5` / `/H6` heuristic |
-| Otherwise | `/P` |
-
-Bold and italic font names are detected via common name suffixes (`Bold`, `Italic`, `Heavy`, `Light`, etc.).
+| 01-004 | Tagged PDF flag (`MarkInfo /Marked true`) |
+| 01-006 | Link elements contain both MCR and OBJR |
+| 06-001 | Document language specified (`/Lang`) |
+| 07-001 | Natural language in metadata |
+| 07-010 | OCProperties properly configured |
+| 07-18.1 | Widget annotations tagged as `/Form` |
+| 07-18.5 | Link annotations tagged as `/Link` |
+| 07-21.3.2 | CIDFontType2 has CIDToGIDMap |
+| 07-21.4.2 | CIDSet streams valid or removed |
+| 09-004 | `/Figure` elements have `/Alt` text |
+| 14-002 | Artifacts correctly marked |
+| 28-002 | XMP metadata includes `pdfuaid:part = 1` |
 
 ---
 
 ## Limitations
 
-- **Scanned PDFs** (image-only) are not supported — the pipeline requires selectable text.
+- **Scanned PDFs** (image-only) are not supported - the pipeline requires selectable text. Run OCR first (e.g., `ocrmypdf`).
 - **Right-to-left scripts** (Arabic, Hebrew) are detected and language-tagged, but reading-order reversal is not applied.
 - **Complex multi-column layouts** may produce suboptimal reading order; manual review is recommended.
-- veraPDF must be installed separately (Java runtime required).
+- **Encrypted PDFs** must be decrypted before processing.
+- **Type1 fonts** - only TTF/OTF embedding is supported (not PostScript Type1).
+- **veraPDF** requires Java 11+ and must be installed separately.
+
+---
+
+## Example Output
+
+```
+PDF Accessibility Remediation Pipeline
+==================================================
+Processing 1 file(s)
+
+[1/1] Processing: annual_report.pdf
+  [1/4] Extracting content from annual_report.pdf...
+        Found 142 text blocks, 8 images across 12 pages
+        Language: en, Title: Annual Report 2024
+        Structure: 18 headings, 3 tables, 21 list items, 4 artifacts
+  [2/4] Adding structure tags to original PDF...
+        Tagged: headings, paragraphs, images, artifacts
+  [3/4] Post-processing metadata with pikepdf...
+        Metadata fixed: MarkInfo, Lang, ViewerPreferences, TabOrder, XMP
+  [4/4] Validating with veraPDF...
+        Validation: PASS (94 passed, 0 failed)
+
+============================
+SUMMARY
+PASS   annual_report.pdf  (3.2s)
+Total: 1 | Processed: 1 | Compliant: 1 | Failed: 0
+```
 
 ---
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+MIT
