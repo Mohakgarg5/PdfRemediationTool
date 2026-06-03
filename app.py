@@ -283,7 +283,9 @@ for idx, uploaded in enumerate(valid_files):
 
             # Stage 3 – Post-process
             progress_bar.progress(80, text="Stage 3/3 — Fixing metadata & fonts…")
-            postprocess_pdf(str(output_path), doc.title, doc.language)
+            pp_report = {}
+            postprocess_pdf(str(output_path), doc.title, doc.language,
+                            report=pp_report)
 
             elapsed = time.time() - t0
             progress_bar.progress(100, text="Done ✓")
@@ -302,6 +304,38 @@ for idx, uploaded in enumerate(valid_files):
   🌐 &nbsp;<strong>Lang:</strong> {doc.language}
 </div>
 """, unsafe_allow_html=True)
+
+            # Transparency: surface any character mappings that were inferred
+            # from context (worth a human glance) or left unresolved, so they
+            # are never silent. See _ensure_used_codes_mapped in pdf_postprocess.
+            tu = pp_report.get("tounicode", {})
+            inferred = tu.get("inferred", [])
+            unresolved = tu.get("unresolved", [])
+            if inferred or unresolved:
+                with st.expander(
+                        f"🔤 Character-mapping notes "
+                        f"({len(inferred)} inferred"
+                        + (f", {len(unresolved)} unresolved" if unresolved else "")
+                        + ")",
+                        expanded=bool(unresolved)):
+                    if inferred:
+                        st.markdown(
+                            "**Auto-inferred from surrounding text** "
+                            "(ligatures Word left unmapped — please skim to "
+                            "confirm they read correctly):")
+                        for it in inferred:
+                            st.markdown(
+                                f"- `{it['font']}` code "
+                                f"`0x{it['code']:02X}` → **“{it['text']}”**")
+                    if unresolved:
+                        st.warning(
+                            "Some characters could not be mapped to Unicode "
+                            "automatically — the file may not be fully "
+                            "PDF/UA compliant for these. Consider re-exporting "
+                            "the source with ligatures disabled:\n"
+                            + "\n".join(
+                                f"- `{u['font']}` code `0x{u['code']:02X}`"
+                                for u in unresolved))
 
             pdf_bytes = output_path.read_bytes()
             st.download_button(

@@ -21,8 +21,14 @@ logger = logging.getLogger(__name__)
 
 
 def postprocess_pdf(pdf_path: str, title: str, language: str,
-                    source_path: str = None) -> str:
-    """Fix catalog-level metadata in the PDF for PDF/UA-1 compliance."""
+                    source_path: str = None, report: dict = None) -> str:
+    """Fix catalog-level metadata in the PDF for PDF/UA-1 compliance.
+
+    If ``report`` is a dict, it is populated with details a caller may want to
+    surface to a user — currently ``report['tounicode']`` with the list of
+    context-inferred and still-unresolved character mappings (see
+    _ensure_used_codes_mapped). Backward-compatible: pass nothing to ignore it.
+    """
     try:
         pdf = pikepdf.Pdf.open(pdf_path, allow_overwriting_input=True)
     except pikepdf.PasswordError:
@@ -40,6 +46,7 @@ def postprocess_pdf(pdf_path: str, title: str, language: str,
     _ensure_role_map(pdf)
     _fix_optional_content(pdf)
     _fix_fonts(pdf)
+    _ensure_used_codes_mapped(pdf, report=report)
     _fix_cid_to_gid_map(pdf)
     _fix_cidset_streams(pdf)
     _fix_annotations(pdf)
@@ -714,6 +721,17 @@ def _fix_fonts(pdf: pikepdf.Pdf):
                 if not embedded:
                     _try_embed_font(pdf, font_obj, base_font)
 
+                # Fallback: any remaining simple font that still has no
+                # ToUnicode (e.g. SymbolMT / MacRomanEncoding fonts used for
+                # bullet glyphs in Word text boxes) gets a ToUnicode CMap
+                # derived from its embedded font program's cmap. Without this,
+                # PAC reports those glyphs as "unreadable text" (Content fail).
+                # Purely additive: only runs when ToUnicode is still absent and
+                # never touches Type0 fonts (they carry their own CMap).
+                if (font_type != "/Type0"
+                        and "/ToUnicode" not in font_obj):
+                    _add_tounicode_from_font_program(pdf, font_obj)
+
             except Exception as e:
                 logger.warning("Font fix failed for '%s': %s", name, e)
                 continue
@@ -792,6 +810,601 @@ def _generate_winansi_tounicode() -> str:
         "end",
     ])
     return "\n".join(lines)
+
+
+def _add_tounicode_from_font_program(pdf: pikepdf.Pdf, font_obj):
+    """Derive and attach a ToUnicode CMap from a simple font's embedded program.
+
+    Handles fonts the WinAnsi path can't (Symbol, MacRoman, custom encodings)
+    by mapping each character code to a glyph name via the embedded font's
+    cmap (and any /Encoding /Differences), then to Unicode via the Adobe Glyph
+    List. Used codes that resolve to a real Unicode value get a bfchar entry.
+
+    No-op (leaves the font untouched) if there is no embedded TrueType program,
+    fontTools is unavailable, or no glyph resolves — never overwrites anything.
+    """
+    desc = font_obj.get("/FontDescriptor")
+    if not desc or "/FontFile2" not in desc:
+        # Only TrueType (FontFile2) programs are parsed here. Type1/CFF
+        # (FontFile/FontFile3) are left alone to avoid risky guesses.
+        return
+
+    code_to_glyph = _build_code_to_glyphname(font_obj)
+    if not code_to_glyph:
+        return
+
+    # Resolve glyph names to Unicode via the Adobe Glyph List.
+    code_to_unicode = {}
+    for code, gname in code_to_glyph.items():
+        uni = _glyphname_to_unicode(gname)
+        if uni:
+            code_to_unicode[code] = uni
+
+    if not code_to_unicode:
+        return
+
+    cmap_str = _generate_tounicode_from_map(code_to_unicode)
+    cmap_stream = pikepdf.Stream(pdf, cmap_str.encode("latin-1"))
+    font_obj[pikepdf.Name("/ToUnicode")] = cmap_stream
+    logger.info("Derived ToUnicode CMap for '%s' (%d glyph(s))",
+                font_obj.get("/BaseFont"), len(code_to_unicode))
+
+
+def _glyphname_to_unicode(gname: str) -> str:
+    """Map a glyph name to a Unicode string via the Adobe Glyph List.
+
+    Handles AGL names, uniXXXX/uXXXXXX forms, and ligature names written with
+    underscores (e.g. 'f_i' -> 'fi'). Returns '' for .notdef or unresolvable
+    (e.g. subset names like 'glyph00041' that carry no semantic information).
+    """
+    if not gname or gname == ".notdef":
+        return ""
+    try:
+        from fontTools import agl
+    except ImportError:
+        return ""
+    try:
+        return agl.toUnicode(gname)
+    except Exception:
+        return ""
+
+
+def _build_code_to_glyphname(font_obj) -> dict:
+    """Map single-byte char codes to glyph names for a simple TrueType font.
+
+    Combines the embedded font program's cmap (preferring single-byte Mac Roman
+    and Symbol subtables) with any explicit /Encoding /Differences overrides.
+    Returns {} if there is no embedded TrueType program or it cannot be parsed.
+    """
+    desc = font_obj.get("/FontDescriptor")
+    if not desc or "/FontFile2" not in desc:
+        return {}
+
+    try:
+        from fontTools.ttLib import TTFont
+    except ImportError:
+        logger.warning("fontTools unavailable — cannot read glyph names for "
+                       "'%s'", font_obj.get("/BaseFont"))
+        return {}
+
+    try:
+        ttf = TTFont(BytesIO(desc["/FontFile2"].read_bytes()))
+    except Exception as e:
+        logger.warning("Could not parse embedded font program for '%s': %s",
+                       font_obj.get("/BaseFont"), e)
+        return {}
+
+    cmap_tables = ttf["cmap"].tables if ttf.get("cmap") else []
+    code_to_glyph = {}
+    if cmap_tables:
+        # Prefer single-byte subtables (Mac Roman 1,0 and Symbol 3,0) since PDF
+        # simple-font codes are single bytes; fall back to whatever exists.
+        chosen = None
+        for pid, eid in ((1, 0), (3, 0), (3, 1), (0, 3)):
+            for st in cmap_tables:
+                if st.platformID == pid and st.platEncID == eid:
+                    chosen = st
+                    break
+            if chosen:
+                break
+        if chosen is None:
+            chosen = cmap_tables[0]
+        for code, gname in chosen.cmap.items():
+            c = code
+            # Symbol (3,0) cmaps store glyphs in the 0xF000-0xF0FF range.
+            if chosen.platformID == 3 and chosen.platEncID == 0 \
+                    and 0xF000 <= code <= 0xF0FF:
+                c = code - 0xF000
+            if 0 <= c <= 0xFF:
+                code_to_glyph[c] = gname
+
+    # Apply explicit /Encoding /Differences (overrides the font's own cmap).
+    encoding_obj = font_obj.get("/Encoding")
+    if isinstance(encoding_obj, pikepdf.Dictionary) \
+            and "/Differences" in encoding_obj:
+        cur = 0
+        for item in encoding_obj["/Differences"]:
+            if isinstance(item, int):
+                cur = item
+            else:
+                code_to_glyph[cur] = str(item).lstrip("/")
+                cur += 1
+
+    return code_to_glyph
+
+
+def _generate_tounicode_from_map(code_to_unicode: dict) -> str:
+    """Build a single-byte ToUnicode CMap from a {code: unicode_str} mapping."""
+    entries = sorted(code_to_unicode.items())
+
+    lines = [
+        "/CIDInit /ProcSet findresource begin",
+        "12 dict begin",
+        "begincmap",
+        "/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def",
+        "/CMapName /Adobe-Identity-UCS def",
+        "/CMapType 2 def",
+        "1 begincodespacerange",
+        "<00> <FF>",
+        "endcodespacerange",
+    ]
+
+    # Split into chunks of 100 (PDF CMap limit per bfchar block).
+    for i in range(0, len(entries), 100):
+        chunk = entries[i:i + 100]
+        lines.append(f"{len(chunk)} beginbfchar")
+        for code, uni in chunk:
+            dst = "".join(f"{ord(ch):04X}" for ch in uni)
+            lines.append(f"<{code:02X}> <{dst}>")
+        lines.append("endbfchar")
+
+    lines.extend([
+        "endcmap",
+        "CMapName currentdict /CMap defineresource pop",
+        "end",
+        "end",
+    ])
+    return "\n".join(lines)
+
+
+# Common Latin ligatures used as the candidate set for context inference.
+# A given subset code is one of these everywhere it appears; the surrounding
+# words disambiguate which. Ordered most-common first.
+_LIGATURE_CANDIDATES = (
+    "ti", "fi", "fl", "ff", "tt", "ffi", "ffl", "ft", "st", "ct",
+    "tf", "fj", "fb", "fh", "fk", "ll", "si", "ssi",
+)
+
+_ENGLISH_WORDS = None  # lazily-loaded frozenset, shared across calls
+
+
+def _ensure_used_codes_mapped(pdf: pikepdf.Pdf, report: dict = None):
+    """Ensure every character code actually drawn has a ToUnicode entry.
+
+    Catches the common Word bug where a generated ToUnicode CMap omits some
+    glyph codes (notably ligatures like 'ti'/'tt'/'fi'), which veraPDF flags
+    under PDF/UA clause 7.21.7 ("all used character codes shall map to
+    Unicode"). For each simple (non-Type0) font, collect the codes used in
+    page content streams together with the text runs they appear in, then for
+    any used code missing from the font's ToUnicode recover Unicode via a
+    layered strategy (see _recover_missing_tounicode) and append it.
+
+    Purely additive: existing ToUnicode entries are never modified, and the
+    pass is a no-op for any font whose used codes are already fully mapped.
+    """
+    # objgen -> (font_obj, list of byte-string runs drawn with that font)
+    runs_by_font = {}
+
+    for page in pdf.pages:
+        res = _resolve_page_resources(page)
+        if not res:
+            continue
+        font_dict = res.get("/Font")
+        if not font_dict:
+            continue
+        name_to_font = {}
+        for name, fobj in font_dict.items():
+            try:
+                if str(fobj.get("/Subtype", "")) != "/Type0":
+                    name_to_font[str(name)] = fobj
+            except Exception:
+                continue
+        if not name_to_font:
+            continue
+
+        try:
+            ops = pikepdf.parse_content_stream(page)
+        except Exception:
+            continue
+
+        cur = None
+        for instr in ops:
+            op = str(instr.operator)
+            if op == "Tf":
+                cur = str(instr.operands[0])
+            elif cur in name_to_font and op in ("Tj", "'", "\"", "TJ"):
+                fobj = name_to_font[cur]
+                try:
+                    objgen = fobj.objgen
+                except Exception:
+                    continue
+                runs = runs_by_font.setdefault(objgen, (fobj, []))[1]
+                if op == "TJ":
+                    # Concatenate the array's strings into one run so word
+                    # boundaries (space glyphs / kerning gaps) are preserved.
+                    parts = [bytes(e) for e in instr.operands[0]
+                             if isinstance(e, (pikepdf.String, bytes))]
+                    if parts:
+                        runs.append(b"".join(parts))
+                else:
+                    runs.append(bytes(instr.operands[-1]))
+
+    for objgen, (font_obj, byte_runs) in runs_by_font.items():
+        try:
+            _recover_missing_tounicode(pdf, font_obj, byte_runs, report=report)
+        except Exception as e:
+            logger.warning("ToUnicode gap-fill failed for '%s': %s",
+                           font_obj.get("/BaseFont"), e)
+
+
+def _recover_missing_tounicode(pdf: pikepdf.Pdf, font_obj, byte_runs,
+                               report: dict = None):
+    """Recover ToUnicode entries for used codes missing from the existing CMap.
+
+    Layered, most-reliable-first; each layer only handles codes the previous
+    ones could not. Purely additive — existing entries are never touched:
+
+      A. Glyph name -> Unicode via the Adobe Glyph List (handles real or
+         'f_i'-style ligature names retained in the cmap/Differences).
+      B. Deterministic recovery from the installed system font: match the
+         subset glyph's outline to the full font and read its Unicode (and
+         decompose ligatures via the full font's GSUB). Exact when available.
+      C. Context inference: a missing code is almost always a ligature; the
+         surrounding words disambiguate which (e.g. 'A·ached' -> 'tt'). Only
+         accepted when one candidate is a clear, confident winner.
+
+    Codes still unresolved after all layers are logged for manual review.
+    """
+    tu = font_obj.get("/ToUnicode")
+    if tu is None:
+        return  # fonts with no ToUnicode are handled earlier in _fix_fonts
+    try:
+        cmap_text = tu.read_bytes().decode("latin-1")
+    except Exception:
+        return
+
+    code_to_unicode = _parse_tounicode_full(cmap_text)
+    used = {b for run in byte_runs for b in run}
+    missing = sorted(c for c in used if c not in code_to_unicode)
+    if not missing:
+        return
+
+    derived = {}
+    code_to_glyph = _build_code_to_glyphname(font_obj)
+
+    # Layer A — glyph name via AGL.
+    for code in list(missing):
+        uni = _glyphname_to_unicode(code_to_glyph.get(code, ""))
+        if uni:
+            derived[code] = uni
+    remaining = [c for c in missing if c not in derived]
+
+    # Layer B — deterministic system-font outline match.
+    if remaining:
+        try:
+            sys_map = _recover_via_system_font(font_obj, code_to_glyph,
+                                               remaining)
+        except Exception as e:
+            logger.debug("System-font recovery failed for '%s': %s",
+                         font_obj.get("/BaseFont"), e)
+            sys_map = {}
+        derived.update(sys_map)
+        remaining = [c for c in remaining if c not in derived]
+
+    # Layer C — context inference.
+    if remaining:
+        try:
+            ctx_map = _recover_via_context(byte_runs, code_to_unicode,
+                                           remaining)
+        except Exception as e:
+            logger.debug("Context inference failed for '%s': %s",
+                         font_obj.get("/BaseFont"), e)
+            ctx_map = {}
+        base_font = str(font_obj.get("/BaseFont", "")).lstrip("/")
+        for code, uni in ctx_map.items():
+            derived[code] = uni
+            logger.info("Inferred code 0x%02X -> %r for '%s' from context",
+                        code, uni, font_obj.get("/BaseFont"))
+            if report is not None:
+                report.setdefault("tounicode", {}).setdefault(
+                    "inferred", []).append(
+                        {"font": base_font, "code": code, "text": uni})
+        remaining = [c for c in remaining if c not in derived]
+
+    if remaining:
+        logger.warning(
+            "Font '%s' uses code(s) %s with no recoverable Unicode mapping; "
+            "ToUnicode left incomplete — manual mapping may be required for "
+            "full PDF/UA compliance.",
+            font_obj.get("/BaseFont"),
+            ", ".join(f"0x{c:02X}" for c in remaining))
+        if report is not None:
+            base_font = str(font_obj.get("/BaseFont", "")).lstrip("/")
+            for c in remaining:
+                report.setdefault("tounicode", {}).setdefault(
+                    "unresolved", []).append({"font": base_font, "code": c})
+
+    if not derived:
+        return
+
+    # Insert a new bfchar block immediately before endcmap — additive, leaves
+    # all existing entries untouched.
+    block_lines = [f"{len(derived)} beginbfchar"]
+    for code, uni in sorted(derived.items()):
+        dst = "".join(f"{ord(ch):04X}" for ch in uni)
+        block_lines.append(f"<{code:02X}> <{dst}>")
+    block_lines.append("endbfchar")
+    block = "\n".join(block_lines) + "\n"
+
+    new_text = cmap_text.replace("endcmap", block + "endcmap", 1)
+    font_obj[pikepdf.Name("/ToUnicode")] = pikepdf.Stream(
+        pdf, new_text.encode("latin-1"))
+    logger.info("Filled %d missing ToUnicode entry(ies) for '%s'",
+                len(derived), font_obj.get("/BaseFont"))
+
+
+def _parse_tounicode_full(cmap_text: str) -> dict:
+    """Parse a ToUnicode CMap into {code: unicode_str} for single-byte codes.
+
+    Reads only inside begin/endbfchar and begin/endbfrange blocks (so the
+    codespacerange is ignored), and correctly increments the destination
+    across bfrange runs (`<32><33><006d>` -> 0x32:'m', 0x33:'n').
+    """
+    import re
+    out = {}
+
+    def _hex_to_str(h):
+        if len(h) % 4:
+            h = h.zfill(4)
+        return bytes.fromhex(h).decode("utf-16-be", "replace")
+
+    for blk in re.findall(r"beginbfchar(.*?)endbfchar", cmap_text, re.S):
+        for code, dst in re.findall(
+                r"<([0-9A-Fa-f]{1,2})>\s*<([0-9A-Fa-f]+)>", blk):
+            out[int(code, 16)] = _hex_to_str(dst)
+
+    for blk in re.findall(r"beginbfrange(.*?)endbfrange", cmap_text, re.S):
+        for lo, hi, dst in re.findall(
+                r"<([0-9A-Fa-f]{1,2})>\s*<([0-9A-Fa-f]{1,2})>\s*<([0-9A-Fa-f]+)>",
+                blk):
+            lo_i, hi_i, base = int(lo, 16), int(hi, 16), int(dst, 16)
+            for i, code in enumerate(range(lo_i, hi_i + 1)):
+                try:
+                    out[code] = chr(base + i)
+                except ValueError:
+                    pass
+    return out
+
+
+def _recover_via_system_font(font_obj, code_to_glyph, codes):
+    """Deterministically recover Unicode by matching glyph outlines to the
+    installed full font (which still has names, cmap and ligature GSUB).
+
+    Returns {code: unicode_str} for codes whose subset glyph outline matches a
+    glyph in the system font. Returns {} when the system font is not installed
+    or anything cannot be parsed — never guesses.
+    """
+    desc = font_obj.get("/FontDescriptor")
+    if not desc or "/FontFile2" not in desc:
+        return {}
+
+    base_raw = str(font_obj.get("/BaseFont", "")).lstrip("/")
+    base = base_raw.split("+", 1)[1] if "+" in base_raw else base_raw
+    location = _find_system_font(base)
+    if not location:
+        return {}
+
+    try:
+        from fontTools.ttLib import TTFont
+        from fontTools.pens.recordingPen import RecordingPen
+    except ImportError:
+        return {}
+
+    def _sig(glyphset, gname):
+        if gname not in glyphset:
+            return None
+        pen = RecordingPen()
+        glyphset[gname].draw(pen)
+        norm = []
+        for op, args in pen.value:
+            pts = tuple(round(c, 1) for pt in args
+                        for c in (pt if isinstance(pt, (tuple, list)) else (pt,)))
+            norm.append((op, pts))
+        return tuple(norm)
+
+    try:
+        if isinstance(location, tuple):
+            full = TTFont(location[0], fontNumber=location[1])
+        else:
+            full = TTFont(location)
+        sub = TTFont(BytesIO(desc["/FontFile2"].read_bytes()))
+    except Exception:
+        return {}
+
+    # full font: glyph name -> Unicode string (direct cmap, plus GSUB ligatures)
+    glyph_to_uni = {}
+    try:
+        for cp, gname in full.getBestCmap().items():
+            glyph_to_uni.setdefault(gname, chr(cp))
+    except Exception:
+        return {}
+    rev_cmap = {}
+    try:
+        for cp, gname in full.getBestCmap().items():
+            rev_cmap.setdefault(gname, cp)
+    except Exception:
+        rev_cmap = {}
+    if "GSUB" in full:
+        try:
+            for lk in full["GSUB"].table.LookupList.Lookup:
+                if lk.LookupType != 4:
+                    continue
+                for st in lk.SubTable:
+                    for first, liglist in getattr(st, "ligatures", {}).items():
+                        for lg in liglist:
+                            comps = [first] + list(lg.Component)
+                            cps = [rev_cmap.get(c) for c in comps]
+                            if all(cp is not None for cp in cps):
+                                glyph_to_uni.setdefault(
+                                    lg.LigGlyph,
+                                    "".join(chr(cp) for cp in cps))
+        except Exception:
+            pass
+
+    # Index the full font's outlines so we can look a subset glyph up by shape.
+    full_gs = full.getGlyphSet()
+    sig_to_uni = {}
+    for gname, uni in glyph_to_uni.items():
+        sig = _sig(full_gs, gname)
+        if sig:
+            sig_to_uni.setdefault(sig, uni)
+
+    sub_gs = sub.getGlyphSet()
+    out = {}
+    for code in codes:
+        gname = code_to_glyph.get(code)
+        if not gname:
+            continue
+        sig = _sig(sub_gs, gname)
+        if sig and sig in sig_to_uni:
+            out[code] = sig_to_uni[sig]
+    return out
+
+
+def _recover_via_context(byte_runs, code_to_unicode, codes):
+    """Infer the Unicode for missing codes (almost always ligatures) from the
+    words they appear in.
+
+    For each missing code, tokenise every run (decoding known glyphs, marking
+    the unknown), then test each ligature candidate by substitution: the
+    candidate that turns the most tokens into real English words wins, but only
+    if it is a *clear* winner (strictly beats the runner-up, hits a high
+    fraction, and has enough evidence). Returns {code: unicode_str} for codes
+    resolved confidently; never guesses otherwise.
+    """
+    words = _load_english_words()
+    if not words:
+        return {}
+
+    # Build, per run, a list of glyphs where each is either a decoded char or
+    # ('UNK', code). Then split into whitespace-delimited tokens.
+    all_tokens = []
+    for run in byte_runs:
+        seq = []
+        for b in run:
+            if b in code_to_unicode:
+                seq.append(code_to_unicode[b])
+            else:
+                seq.append(("UNK", b))
+        token = []
+        for g in seq:
+            if g == " ":
+                if token:
+                    all_tokens.append(token)
+                token = []
+            else:
+                token.append(g)
+        if token:
+            all_tokens.append(token)
+
+    out = {}
+    for code in codes:
+        toks = [t for t in all_tokens
+                if any(isinstance(g, tuple) and g[1] == code for g in t)]
+        if not toks:
+            continue
+
+        scored = []
+        for cand in _LIGATURE_CANDIDATES:
+            hits = total = 0
+            for t in toks:
+                s = "".join(
+                    (cand if g[1] == code else "") if isinstance(g, tuple)
+                    else g
+                    for g in t)
+                if any(ch.isalpha() for ch in s):
+                    total += 1
+                    if _is_english_word(s, words):
+                        hits += 1
+            if total:
+                scored.append((hits, total, cand))
+        if not scored:
+            continue
+        scored.sort(reverse=True)
+        best = scored[0]
+        runner = scored[1] if len(scored) > 1 else (0, 0, "")
+
+        # Confidence gate: clear winner, strong hit fraction, real evidence.
+        best_hits, best_total, best_cand = best
+        if (best_hits > runner[0]
+                and best_hits >= 1
+                and best_hits / best_total >= 0.6):
+            out[code] = best_cand
+    return out
+
+
+def _load_english_words():
+    """Load the bundled English wordlist (lowercased) as a frozenset, cached.
+
+    Falls back to /usr/share/dict/words, then to an empty set (which disables
+    context inference) if no wordlist is available.
+    """
+    global _ENGLISH_WORDS
+    if _ENGLISH_WORDS is not None:
+        return _ENGLISH_WORDS
+
+    words = set()
+    bundled = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "data", "words_en.txt.gz")
+    try:
+        import gzip
+        with gzip.open(bundled, "rt", encoding="ascii") as fh:
+            for line in fh:
+                w = line.strip()
+                if w:
+                    words.add(w)
+    except Exception:
+        try:
+            with open("/usr/share/dict/words", encoding="utf-8",
+                      errors="ignore") as fh:
+                for line in fh:
+                    w = line.strip().lower()
+                    if len(w) >= 2 and w.isalpha():
+                        words.add(w)
+        except Exception:
+            logger.info("No English wordlist available — context-based "
+                        "ToUnicode inference disabled.")
+
+    _ENGLISH_WORDS = frozenset(words)
+    return _ENGLISH_WORDS
+
+
+def _is_english_word(token: str, words) -> bool:
+    """True if a token (after stripping non-letters) is a real English word,
+    tolerating common inflections so a limited base wordlist still matches
+    plurals/past tenses (e.g. 'motives' -> 'motive')."""
+    import re
+    t = re.sub(r"[^A-Za-z]", "", token).lower()
+    if len(t) < 2:
+        return False
+    if t in words:
+        return True
+    for suf in ("s", "es", "ed", "ing", "d", "ly"):
+        if t.endswith(suf) and t[:-len(suf)] in words:
+            return True
+    if t.endswith("ies") and (t[:-3] + "y") in words:
+        return True
+    return False
 
 
 def _try_embed_font(pdf: pikepdf.Pdf, font_obj, base_font: str):
