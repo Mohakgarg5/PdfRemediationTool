@@ -68,9 +68,21 @@ class ImageBlock:
 
 
 @dataclass
+class TableCell:
+    """One cell of a detected table, with position and role."""
+    text: str
+    bbox: BBox
+    row: int = 0
+    col: int = 0
+    is_header: bool = False
+
+
+@dataclass
 class TableBlock:
     """A detected table structure."""
-    rows: list = field(default_factory=list)
+    rows: list = field(default_factory=list)      # list[list[str]] (legacy view)
+    cells: list = field(default_factory=list)     # list[TableCell] (structured)
+    n_cols: int = 0
     header_rows: int = 1
     bbox: Optional[BBox] = None
     page_number: int = 0
@@ -85,6 +97,7 @@ class PageContent:
     text_blocks: list = field(default_factory=list)
     images: list = field(default_factory=list)
     tables: list = field(default_factory=list)
+    fill_rects: list = field(default_factory=list)  # BBox of filled rectangles
 
 
 @dataclass

@@ -13,14 +13,14 @@ from io import BytesIO
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import (
     LAParams, LTTextBox, LTTextLine, LTChar, LTAnno,
-    LTFigure, LTImage, LTPage,
+    LTFigure, LTImage, LTPage, LTRect, LTCurve,
 )
 import pikepdf
 from langdetect import detect as detect_language
 
 from models import (
     DocumentContent, PageContent, TextBlock, ImageBlock,
-    TableBlock, FontInfo, BBox, ElementType,
+    TableBlock, TableCell, FontInfo, BBox, ElementType,
 )
 import config
 
@@ -178,6 +178,18 @@ def _process_layout_element(element, page_content: PageContent, page_num: int):
             bbox=BBox(element.x0, element.y0, element.x1, element.y1),
             page_number=page_num,
         ))
+
+    elif isinstance(element, (LTRect, LTCurve)):
+        # Filled rectangles form table cell backgrounds; capture them so tables
+        # can be reconstructed from their true cell grid rather than guessed
+        # from text positions.
+        if getattr(element, "fill", False):
+            w = element.x1 - element.x0
+            h = element.y1 - element.y0
+            if w >= 20 and h >= 8:
+                page_content.fill_rects.append(
+                    BBox(element.x0, element.y0, element.x1, element.y1)
+                )
 
 
 def _split_text_box_by_lines(line_infos, line_sizes, page_content, page_num):
@@ -420,6 +432,59 @@ def _is_list_item(text: str) -> bool:
     return bool(_LIST_ITEM_RE.match(text))
 
 
+_HEADING_PROSE_RE = None
+
+
+def _looks_like_heading_text(text: str) -> bool:
+    """Heuristic gate: is this text plausibly a heading rather than body prose?
+
+    Font size / bold alone over-fires — bold body sentences, lead-in
+    sentences, and citations get mis-tagged as headings, which breaks
+    heading-based navigation (WCAG 1.3.1). A real heading is a short label,
+    not a sentence. This rejects:
+      - empty / whitespace-only text
+      - long text (headings are short)
+      - multi-sentence prose (sentence punctuation followed by more text)
+      - full sentences that end in terminal/lead-in punctuation
+
+    It is intentionally conservative: it only vetoes text that clearly reads
+    as prose, so genuine headings (even long ones) still pass.
+    """
+    global _HEADING_PROSE_RE
+    import re
+    if _HEADING_PROSE_RE is None:
+        # sentence break: .?! or ) followed by whitespace then an opening
+        # character (capital letter, digit, quote, or paren) => >1 sentence
+        _HEADING_PROSE_RE = re.compile(r'[.?!)]\s+[\"\'(A-Z0-9]')
+
+    t = " ".join(text.split())  # normalize newlines / runs of whitespace
+    if not t:
+        return False
+    if len(t) > 120:
+        return False
+    words = t.split()
+    # Headings are short labels. A dozen words is already generous; anything
+    # longer reads as a sentence/clause.
+    if len(words) > 12:
+        return False
+    # Multi-sentence prose is never a heading.
+    core = t[:-1] if t[-1] in ".?!" else t
+    if _HEADING_PROSE_RE.search(core):
+        return False
+    # A clause of several words that ends in terminal/lead-in punctuation
+    # (". " "? " "! " ": " "; ") reads as a sentence or question, not a label.
+    # Short labels that end in a colon ("Note:", "Table 1:") are kept.
+    if t[-1] in ".:;?!" and len(words) >= 6:
+        return False
+    # Headings are capitalized. Text whose first letter is lowercase is almost
+    # always a prose fragment split off mid-sentence ("concede?", "based
+    # outcomes?"), not a heading.
+    first_alpha = next((c for c in t if c.isalpha()), "")
+    if first_alpha and first_alpha.islower():
+        return False
+    return True
+
+
 _ROMAN_NUMERAL_RE = None
 
 
@@ -579,31 +644,42 @@ def _classify_elements(page: PageContent, body_font_size: float, hf_signatures: 
             tb.element_type = ElementType.LIST_ITEM
             continue
 
-        # Heading detection by font size ratio
+        # Heading detection by font size ratio.
+        # Gate on heading-like text: font size / bold alone over-fires and
+        # tags body prose as headings, which wrecks heading navigation
+        # (WCAG 1.3.1). A block must both look like a heading (short label,
+        # not a sentence) AND carry a heading style signal.
         ratio = tb.font.size / body_font_size if body_font_size > 0 else 1.0
+        head_ok = _looks_like_heading_text(tb.text)
 
-        if ratio >= config.HEADING_SIZE_RATIO_H1:
+        if head_ok and ratio >= config.HEADING_SIZE_RATIO_H1:
             tb.element_type = ElementType.HEADING
             tb.heading_level = 1
-        elif ratio >= config.HEADING_SIZE_RATIO_H2:
+        elif head_ok and ratio >= config.HEADING_SIZE_RATIO_H2:
             tb.element_type = ElementType.HEADING
             tb.heading_level = 2
-        elif ratio >= config.HEADING_SIZE_RATIO_H3:
+        elif head_ok and ratio >= config.HEADING_SIZE_RATIO_H3:
             tb.element_type = ElementType.HEADING
             tb.heading_level = 3
-        elif ratio >= config.HEADING_SIZE_RATIO_H4 and tb.font.is_bold:
+        elif head_ok and ratio >= config.HEADING_SIZE_RATIO_H4 and tb.font.is_bold:
             tb.element_type = ElementType.HEADING
             tb.heading_level = 4
-        elif tb.font.is_bold and ratio >= 1.0 and len(tb.text) < 200:
+        elif head_ok and tb.font.is_bold and ratio >= 1.0:
             tb.element_type = ElementType.HEADING
             tb.heading_level = 5
-        elif (ratio >= 0.95 and len(tb.text) < 200
+        elif (head_ok and ratio >= 0.95
               and tb.text.strip() == tb.text.strip().upper()
               and any(c.isalpha() for c in tb.text)):
             tb.element_type = ElementType.HEADING
             tb.heading_level = 6
         else:
             tb.element_type = ElementType.PARAGRAPH
+
+        # Text in the header/footer band is page furniture (document codes,
+        # running heads), not document structure — never a heading.
+        if tb.element_type == ElementType.HEADING and (in_header or in_footer):
+            tb.element_type = ElementType.PARAGRAPH
+            tb.heading_level = None
 
 
 def _normalize_heading_hierarchy(pages: list):
@@ -635,65 +711,214 @@ def _normalize_heading_hierarchy(pages: list):
 
 
 def _detect_tables(page: PageContent, body_font_size: float = 12.0):
-    """Detect table structures by finding grid-aligned text blocks."""
-    if len(page.text_blocks) < 4:
+    """Reconstruct tables from filled cell-background rectangles.
+
+    DRRC/Word tables draw a filled rectangle behind every cell, so the rects
+    define the exact column/row grid — far more reliable than guessing a grid
+    from text positions (which fails on wrapped multi-line cells). Text blocks
+    are assigned to the cell rect that contains them; row 0 is the header row.
+    Regions whose rects don't form a clean grid are skipped, and any leftover
+    table-like region's bold cells are demoted from heading to paragraph so
+    table content never leaks out as document headings.
+    """
+    _detect_tables_from_rects(page, body_font_size)
+    _demote_stray_table_headings(page, body_font_size)
+
+
+def _detect_tables_from_rects(page: PageContent, body_font_size: float):
+    rects = list(page.fill_rects)
+    if len(rects) < 4:
         return
 
-    ROW_TOLERANCE = max(3.0, min(8.0, body_font_size * 0.4))
-    rows_by_y = {}
-    for tb in page.text_blocks:
-        if tb.element_type != ElementType.PARAGRAPH:
-            continue
-        y_key = round(tb.bbox.y0 / ROW_TOLERANCE) * ROW_TOLERANCE
-        rows_by_y.setdefault(y_key, []).append(tb)
+    # Keep maximal rects (drop those contained within another): a cell often
+    # has both an outer background rect and an inset text-clip rect.
+    tuples = sorted(
+        {(r.x0, r.y0, r.x1, r.y1) for r in rects},
+        key=lambda b: -((b[2]-b[0]) * (b[3]-b[1])),
+    )
 
-    multi_col_rows = {y: blocks for y, blocks in rows_by_y.items()
-                      if len(blocks) >= 2}
+    def _contains(a, b):
+        return (a[0] <= b[0] + 1 and a[1] <= b[1] + 1
+                and a[2] >= b[2] - 1 and a[3] >= b[3] - 1 and a != b)
 
-    if len(multi_col_rows) < 2:
+    maximal = [b for b in tuples if not any(_contains(o, b) for o in tuples)]
+    if len(maximal) < 4:
         return
 
-    sorted_ys = sorted(multi_col_rows.keys(), reverse=True)
-    first_row = sorted(multi_col_rows[sorted_ys[0]], key=lambda b: b.bbox.x0)
-    col_count = len(first_row)
+    # Group rects into rows by vertical overlap.
+    maximal.sort(key=lambda b: -b[3])  # top→bottom
+    rows_r: list = []
+    for b in maximal:
+        placed = False
+        for row in rows_r:
+            ry0 = min(c[1] for c in row); ry1 = max(c[3] for c in row)
+            overlap = min(b[3], ry1) - max(b[1], ry0)
+            if overlap > 0.4 * min(b[3]-b[1], ry1-ry0):
+                row.append(b); placed = True; break
+        if not placed:
+            rows_r.append([b])
+    rows_r.sort(key=lambda row: -max(c[3] for c in row))
 
-    table_rows = []
-    table_blocks = []  # store actual block references for bbox calculation
+    COL_TOL = max(6.0, body_font_size * 0.7)
 
-    for y in sorted_ys:
-        row_blocks = sorted(multi_col_rows[y], key=lambda b: b.bbox.x0)
-        if len(row_blocks) >= col_count - 1:
-            row_texts = [b.text for b in row_blocks]
-            table_rows.append(row_texts)
-            table_blocks.extend(row_blocks)
+    def _col_set(row):
+        xs = sorted(b[0] for b in row)
+        cols = []
+        for x in xs:
+            if not cols or x - cols[-1] > COL_TOL:
+                cols.append(x)
+        return cols
 
-    if len(table_rows) >= 2:
-        # Use direct bbox comparison instead of id()
-        table_block_bboxes = [
-            (b.bbox.x0, b.bbox.y0, b.bbox.x1, b.bbox.y1) for b in table_blocks
-        ]
-        if table_blocks:
-            table_bbox = BBox(
-                x0=min(b.bbox.x0 for b in table_blocks),
-                y0=min(b.bbox.y0 for b in table_blocks),
-                x1=max(b.bbox.x1 for b in table_blocks),
-                y1=max(b.bbox.y1 for b in table_blocks),
-            )
+    # Segment consecutive rows into separate tables: a new table starts on a
+    # large vertical gap or when the column layout changes (a page can hold
+    # several tables — e.g. a continued table plus a new one).
+    segments: list = []
+    cur: list = []
+    for row in rows_r:
+        if not cur:
+            cur = [row]; continue
+        prev = cur[-1]
+        gap = min(c[1] for c in prev) - max(c[3] for c in row)
+        prev_cols = _col_set(prev); cur_cols = _col_set(row)
+        same_cols = (len(prev_cols) == len(cur_cols) and all(
+            any(abs(a - b) <= COL_TOL for b in cur_cols) for a in prev_cols))
+        if gap > body_font_size * 1.6 or not same_cols:
+            segments.append(cur); cur = [row]
         else:
-            table_bbox = None
+            cur.append(row)
+    if cur:
+        segments.append(cur)
 
-        table = TableBlock(
-            rows=table_rows,
-            header_rows=1,
-            bbox=table_bbox,
-            page_number=page.page_number,
-        )
-        page.tables.append(table)
-        # Remove table blocks using bbox equality instead of id()
-        page.text_blocks = [
-            tb for tb in page.text_blocks
-            if (tb.bbox.x0, tb.bbox.y0, tb.bbox.x1, tb.bbox.y1) not in table_block_bboxes
-        ]
+    for seg in segments:
+        _build_table_from_rows(page, seg, body_font_size, COL_TOL)
+
+
+def _build_table_from_rows(page, seg_rows, body_font_size, COL_TOL):
+    if len(seg_rows) < 2:
+        return
+    lefts = sorted(b[0] for row in seg_rows for b in row)
+    col_lefts: list = []
+    for lx in lefts:
+        if not col_lefts or lx - col_lefts[-1] > COL_TOL:
+            col_lefts.append(lx)
+    col_count = len(col_lefts)
+    if col_count < 2:
+        return
+
+    def _col_of_x(x0):
+        for i, cl in enumerate(col_lefts):
+            if abs(x0 - cl) <= COL_TOL:
+                return i
+        return -1
+
+    grid_rows = []
+    for row in seg_rows:
+        cols: dict = {}
+        for b in row:
+            c = _col_of_x(b[0])
+            if c >= 0 and c not in cols:
+                cols[c] = b
+        if cols:
+            grid_rows.append((min(c[1] for c in row),
+                              max(c[3] for c in row), cols))
+    grid_rows.sort(key=lambda r: -r[1])
+
+    full = [r for r in grid_rows if len(r[2]) >= max(2, col_count - 1)]
+    if len(full) < 2 or len(full) < len(grid_rows) * 0.75:
+        return
+
+    text_candidates = [
+        tb for tb in page.text_blocks
+        if tb.element_type in (
+            ElementType.PARAGRAPH, ElementType.HEADING, ElementType.LIST_ITEM
+        ) and tb.text.strip()
+    ]
+
+    cells = []; used = []
+    n_rows = len(grid_rows)
+    for r_idx, (ry0, ry1, cols) in enumerate(grid_rows):
+        for c_idx in range(col_count):
+            rect = cols.get(c_idx)
+            if rect is None:
+                continue
+            inside = [
+                tb for tb in text_candidates
+                if (rect[0] - COL_TOL <= (tb.bbox.x0 + tb.bbox.x1) / 2
+                    <= rect[2] + COL_TOL)
+                and (rect[1] - 2 <= (tb.bbox.y0 + tb.bbox.y1) / 2 <= rect[3] + 2)
+            ]
+            if not inside:
+                continue
+            inside.sort(key=lambda b: (-b.bbox.y1, b.bbox.x0))
+            text = " ".join(" ".join(b.text.split()) for b in inside)
+            cb = BBox(
+                x0=min(b.bbox.x0 for b in inside),
+                y0=min(b.bbox.y0 for b in inside),
+                x1=max(b.bbox.x1 for b in inside),
+                y1=max(b.bbox.y1 for b in inside),
+            )
+            cells.append(TableCell(text=text, bbox=cb, row=r_idx, col=c_idx,
+                                   is_header=(r_idx == 0)))
+            used.extend(inside)
+
+    if len({c.row for c in cells}) < 2 or not used:
+        return
+
+    table_bbox = BBox(
+        x0=min(t.bbox.x0 for t in used), y0=min(t.bbox.y0 for t in used),
+        x1=max(t.bbox.x1 for t in used), y1=max(t.bbox.y1 for t in used),
+    )
+    page.tables.append(TableBlock(
+        rows=[[c.text for c in cells if c.row == ri] for ri in range(n_rows)],
+        cells=cells, n_cols=col_count, header_rows=1,
+        bbox=table_bbox, page_number=page.page_number,
+    ))
+    used_ids = {id(b) for b in used}
+    page.text_blocks = [tb for tb in page.text_blocks if id(tb) not in used_ids]
+
+
+def _demote_stray_table_headings(page: PageContent, body_font_size: float):
+    """Demote bold cells of tables we could not reconstruct from heading to
+    paragraph, so table content never leaks out as document headings.
+
+    A heading is demoted only when >=2 cell-background rects sit side by side
+    at its vertical level — i.e. it is inside a multi-column table row. Single
+    full-width banner rects (section banners like "Teaching Note") have only
+    one rect at that level and are left as genuine headings.
+    """
+    rects = page.fill_rects
+    if not rects:
+        return
+    COL_TOL = max(6.0, body_font_size * 0.7)
+    for tb in page.text_blocks:
+        if tb.element_type != ElementType.HEADING:
+            continue
+        cy = (tb.bbox.y0 + tb.bbox.y1) / 2
+        band = [r for r in rects if r.y0 - 2 <= cy <= r.y1 + 2]
+        xs = sorted(r.x0 for r in band)
+        cols: list = []
+        for x in xs:
+            if not cols or x - cols[-1] > COL_TOL:
+                cols.append(x)
+        if len(cols) >= 2:
+            tb.element_type = ElementType.PARAGRAPH
+            tb.heading_level = None
+
+
+def _is_decorative_image(bbox, page_height: float) -> bool:
+    """Letterhead/footer-band images are branding/decoration.
+
+    An image whose vertical center sits in the top ~12% (letterhead) or bottom
+    ~8% (footer) of the page is treated as decorative — tagged as an Artifact
+    with no alt text, which is WCAG 1.1.1-correct when the source/organization
+    is also identified in text (as in DRRC letterheads). Body images are left
+    as /Figure so a real description can be supplied. Rule-based code cannot
+    invent a meaningful description for an arbitrary content image.
+    """
+    if page_height <= 0:
+        return False
+    cy = (bbox.y0 + bbox.y1) / 2
+    return cy > page_height * 0.88 or cy < page_height * 0.08
 
 
 def _extract_images(pdf_path: str, pages: list):
@@ -752,6 +977,9 @@ def _extract_images(pdf_path: str, pages: list):
 
                 if img_index < len(page_content.images):
                     image_block.bbox = page_content.images[img_index].bbox
+                    image_block.is_decorative = _is_decorative_image(
+                        image_block.bbox, page_content.height
+                    )
                     page_content.images[img_index] = image_block
                 else:
                     page_content.images.append(image_block)

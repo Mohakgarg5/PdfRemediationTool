@@ -202,6 +202,20 @@ def _build_block_index(page_content: Optional[PageContent]) -> list:
             "used": False,
         })
 
+    # Table cells: matched by position and tagged /TH (header) or /TD, carrying
+    # table/row identity so the structure tree can rebuild /Table>/TR>/cell.
+    for t_idx, table in enumerate(getattr(page_content, "tables", []) or []):
+        for cell in table.cells:
+            blocks.append({
+                "bbox": cell.bbox,
+                "struct_type": "/TH" if cell.is_header else "/TD",
+                "text": cell.text,
+                "is_artifact": False,
+                "table_id": t_idx,
+                "table_row": cell.row,
+                "table_col": cell.col,
+            })
+
     return blocks
 
 
@@ -339,6 +353,29 @@ def _insert_markers(ops, blocks, page, watermark_forms, mcid_counter,
     struct_open = False
     current_block_idx = -1
 
+    # -- logical-element grouping --
+    # PDF nesting forbids a BDC/EMC pair from crossing a q/Q or BT/ET boundary,
+    # so one visual heading/paragraph is emitted as several marked-content runs
+    # (Word wraps nearly every run in q/Q). Each run would otherwise become its
+    # own /H* or /P structure element — fragmenting a single heading into many
+    # and turning whitespace runs into empty headings. We stamp every run with
+    # a group id: consecutive runs of the SAME block share one id, so the tree
+    # builder can collapse them back into one structure element.
+    group_id = [0]
+    last_group_block = [None]
+
+    def _grp(bidx):
+        if bidx is not None and bidx == last_group_block[0]:
+            return group_id[0]
+        group_id[0] += 1
+        last_group_block[0] = bidx
+        return group_id[0]
+
+    def _grp_break():
+        # Force the next block to start a fresh group so non-mergeable elements
+        # (figures, links) never absorb adjacent text.
+        last_group_block[0] = None
+
     def _open_artifact():
         nonlocal artifact_open
         if not artifact_open:
@@ -397,6 +434,9 @@ def _insert_markers(ops, blocks, page, watermark_forms, mcid_counter,
             current_block_idx = bidx
             struct_elems.append((
                 mcid, block["struct_type"], block.get("alt_text", ""),
+                None, None, _grp(bidx),
+                block.get("table_id"), block.get("table_row"),
+                block.get("table_col"),
             ))
 
     def _open_struct_for_link(lidx):
@@ -432,6 +472,7 @@ def _insert_markers(ops, blocks, page, watermark_forms, mcid_counter,
             # ensures the continuation text is still properly tagged.
             struct_elems.append((mcid, "/Span", ""))
             logger.debug("Link annot %d re-tagged as /Span (q/Q split)", lidx)
+        _grp_break()
 
     def _open_struct_unmatched():
         nonlocal struct_open, current_block_idx
@@ -451,7 +492,7 @@ def _insert_markers(ops, blocks, page, watermark_forms, mcid_counter,
         ))
         struct_open = True
         current_block_idx = -2
-        struct_elems.append((mcid, "/P", ""))
+        struct_elems.append((mcid, "/P", "", None, None, _grp(-2)))
 
     # -- start with artifact wrapper --
     _open_artifact()
@@ -602,6 +643,7 @@ def _insert_markers(ops, blocks, page, watermark_forms, mcid_counter,
                     fig_bbox = [min(x0, x1), min(y0, y1),
                                 max(x0, x1), max(y0, y1)]
                     struct_elems.append((mcid, "/Figure", alt, fig_bbox))
+                    _grp_break()
                     _open_artifact()
                     continue
 
@@ -630,10 +672,18 @@ def _insert_markers(ops, blocks, page, watermark_forms, mcid_counter,
 def _find_block(x: float, y: float, blocks: list) -> int:
     """Find the text block whose bbox best matches position (x, y).
 
-    Uses adaptive tolerance based on the block's own size.
+    Ranks candidates by distance to the block's bbox *edge* (zero when the
+    point is inside), not to its center. A center metric penalizes wide
+    blocks: left-margin text in a full-width paragraph sits far from that
+    paragraph's center-x, so a narrow heading directly above it could win and
+    steal the paragraph's first line. Edge distance makes the block that
+    actually contains the text win; ties break toward the smaller (more
+    specific) block. An adaptive tolerance still gates which blocks are even
+    considered, so far-away blocks are ignored.
     """
     best_idx = -1
     best_dist = float("inf")
+    best_area = float("inf")
 
     for idx, block in enumerate(blocks):
         if block["struct_type"] == "/Figure":
@@ -647,11 +697,14 @@ def _find_block(x: float, y: float, blocks: list) -> int:
 
         if (bbox.x0 - tol_x <= x <= bbox.x1 + tol_x and
                 bbox.y0 - tol_y <= y <= bbox.y1 + tol_y):
-            cx = (bbox.x0 + bbox.x1) / 2
-            cy = (bbox.y0 + bbox.y1) / 2
-            dist = abs(x - cx) + abs(y - cy)
-            if dist < best_dist:
+            # Distance to bbox edge (0 if the point is inside the bbox).
+            dx = max(bbox.x0 - x, 0.0, x - bbox.x1)
+            dy = max(bbox.y0 - y, 0.0, y - bbox.y1)
+            dist = dx + dy
+            area = bw * bh
+            if dist < best_dist or (dist == best_dist and area < best_area):
                 best_dist = dist
+                best_area = area
                 best_idx = idx
 
     return best_idx
@@ -815,26 +868,86 @@ def _build_structure_tree(pdf: pikepdf.Pdf, all_page_elems: list,
     - Consecutive /TD|/TH elements are wrapped in /Table -> /TR
     - All other types (/P, /H1-/H6, /Figure, etc.) go directly under /Document
     """
-    # Pass 1: sequence-based heading normalization (PDF/UA Clause 7.4.2).
-    # The rule: when heading level increases, it must go up by exactly 1.
-    # Walk headings in document order; if a heading jumps more than +1 from
-    # the previous heading, clamp it to prev_level + 1.
-    # e.g. sequence H3,H1,H4,H2,H3 → H1,H1,H2,H2,H3 (no forward jumps > 1).
     _heading_re = re.compile(r'^/H(\d+)$')
-    _elem_overrides: dict = {}   # (page_idx, elem_idx) → new struct_type
+    # Only block-level text flows are collapsed. /LI, /TD, /TH, /Figure, /Link,
+    # /Span keep their 1:1 mapping so list/table/link/figure handling is intact.
+    _MERGEABLE_NONHEAD = frozenset(["/P"])
+
+    # -- Pass 1: collapse marked-content runs into logical elements ----------
+    # Consecutive runs sharing a group id and struct type belong to one visual
+    # heading/paragraph that PDF nesting rules forced us to split across q/Q or
+    # BT/ET boundaries. Merge them into one element whose /K lists every MCR, so
+    # a heading reads as ONE heading (not many) and interleaved whitespace runs
+    # fold in instead of becoming empty headings.
+    logical_pages = []  # (page_idx, [group, ...])
+    for page_idx, struct_elems in all_page_elems:
+        if not struct_elems or page_idx >= len(pdf.pages):
+            continue
+        groups: list = []
+        cell_groups: dict = {}   # (table_id,row,col) -> group (one leaf/cell)
+        for elem_data in struct_elems:
+            mcid = elem_data[0]
+            struct_type = elem_data[1]
+            alt_text = elem_data[2]
+            fig_bbox = elem_data[3] if len(elem_data) > 3 else None
+            annot_obj = elem_data[4] if len(elem_data) > 4 else None
+            gid = elem_data[5] if len(elem_data) > 5 else None
+            table_id = elem_data[6] if len(elem_data) > 6 else None
+            table_row = elem_data[7] if len(elem_data) > 7 else None
+            table_col = elem_data[8] if len(elem_data) > 8 else None
+
+            # Table cells collapse by (table, row, col) so every marked-content
+            # run of one cell — even if split — maps to exactly one /TD|/TH.
+            if struct_type in ("/TD", "/TH") and table_id is not None:
+                key = (table_id, table_row, table_col)
+                g = cell_groups.get(key)
+                if g is not None:
+                    g["mcids"].append(mcid)
+                    continue
+                g = {
+                    "mcids": [mcid], "type": struct_type, "alt": alt_text,
+                    "bbox": fig_bbox, "annot": annot_obj, "gid": gid,
+                    "mergeable": True,
+                    "table_id": table_id, "table_row": table_row,
+                    "table_col": table_col,
+                }
+                cell_groups[key] = g
+                groups.append(g)
+                continue
+
+            # /P and /H* collapse per group so a wrapped multi-line
+            # paragraph/heading becomes ONE element.
+            mergeable = gid is not None and (
+                bool(_heading_re.match(struct_type))
+                or struct_type in _MERGEABLE_NONHEAD
+            )
+            if (mergeable and groups and groups[-1]["mergeable"]
+                    and groups[-1]["gid"] == gid
+                    and groups[-1]["type"] == struct_type):
+                groups[-1]["mcids"].append(mcid)
+            else:
+                groups.append({
+                    "mcids": [mcid], "type": struct_type, "alt": alt_text,
+                    "bbox": fig_bbox, "annot": annot_obj, "gid": gid,
+                    "mergeable": mergeable,
+                    "table_id": table_id, "table_row": table_row,
+                    "table_col": table_col,
+                })
+        logical_pages.append((page_idx, groups))
+
+    # -- Pass 2: heading-level normalization (PDF/UA Clause 7.4.2) -----------
+    # Over logical elements (not fragments): when a heading level increases it
+    # must go up by exactly 1. e.g. H3,H1,H4,H2 → H1,H1,H2,H2.
     _prev_level = 0
-    for _pi, _se in all_page_elems:
-        for _ei, _ed in enumerate(_se):
-            _m = _heading_re.match(_ed[1])
+    for _pi, groups in logical_pages:
+        for g in groups:
+            _m = _heading_re.match(g["type"])
             if _m:
                 _lvl = int(_m.group(1))
                 if _lvl > _prev_level + 1:
                     _lvl = _prev_level + 1
-                    _elem_overrides[(_pi, _ei)] = f"/H{_lvl}"
+                    g["type"] = f"/H{_lvl}"
                 _prev_level = _lvl
-
-    def _remap_struct_type(page_idx: int, elem_idx: int, st: str) -> str:
-        return _elem_overrides.get((page_idx, elem_idx), st)
 
     doc_kids = pikepdf.Array()
     doc_elem = pdf.make_indirect(pikepdf.Dictionary({
@@ -847,51 +960,45 @@ def _build_structure_tree(pdf: pikepdf.Pdf, all_page_elems: list,
     all_leaf_elems = []  # (elem_ref, struct_type) for grouping
     annot_parent_entries = []  # (annot_obj, elem_ref) for annotation ParentTree
 
-    for page_idx, struct_elems in all_page_elems:
-        if not struct_elems:
-            continue
-
-        if page_idx >= len(pdf.pages):
-            continue
-
+    # -- Pass 3: build structure elements ------------------------------------
+    for page_idx, groups in logical_pages:
         page_ref = pdf.pages[page_idx].obj
-        page_elem_refs = []
+        # ParentTree for a page is indexed by MCID, so each MCID must map to its
+        # owning element. Build the array by MCID index (cells may collapse
+        # non-contiguous runs, so append-order is not MCID-order).
+        mcid_to_elem = {}
 
-        for elem_idx, elem_data in enumerate(struct_elems):
-            # Tuples: (mcid, type, alt) or (mcid, type, alt, bbox)
-            #     or: (mcid, "/Link", alt, None, annot_obj)
-            mcid = elem_data[0]
-            struct_type = _remap_struct_type(page_idx, elem_idx, elem_data[1])
-            alt_text = elem_data[2]
-            fig_bbox = elem_data[3] if len(elem_data) > 3 else None
-            annot_obj = elem_data[4] if len(elem_data) > 4 else None
-
-            mcr = pikepdf.Dictionary({
+        for g in groups:
+            struct_type = g["type"]
+            mcrs = [pikepdf.Dictionary({
                 "/Type": pikepdf.Name("/MCR"),
                 "/Pg": page_ref,
-                "/MCID": mcid,
-            })
+                "/MCID": m,
+            }) for m in g["mcids"]]
 
             elem_dict = {
                 "/Type": pikepdf.Name("/StructElem"),
                 "/S": pikepdf.Name(struct_type),
             }
 
-            if struct_type == "/Link" and annot_obj is not None:
+            if struct_type == "/Link" and g["annot"] is not None:
                 # /Link with annotation: K = [MCR, OBJR]
                 objr = pikepdf.Dictionary({
                     "/Type": pikepdf.Name("/OBJR"),
                     "/Pg": page_ref,
-                    "/Obj": annot_obj,
+                    "/Obj": g["annot"],
                 })
-                elem_dict["/K"] = pikepdf.Array([mcr, objr])
+                elem_dict["/K"] = pikepdf.Array([mcrs[0], objr])
+            elif len(mcrs) == 1:
+                elem_dict["/K"] = mcrs[0]
             else:
-                elem_dict["/K"] = mcr
+                elem_dict["/K"] = pikepdf.Array(mcrs)
 
-            if struct_type == "/Figure" and alt_text:
-                elem_dict["/Alt"] = pikepdf.String(alt_text)
+            if struct_type == "/Figure" and g["alt"]:
+                elem_dict["/Alt"] = pikepdf.String(g["alt"])
 
-            if struct_type == "/Figure" and fig_bbox:
+            if struct_type == "/Figure" and g["bbox"]:
+                fig_bbox = g["bbox"]
                 elem_dict["/A"] = pikepdf.Dictionary({
                     "/O": pikepdf.Name("/Layout"),
                     "/BBox": pikepdf.Array([
@@ -902,12 +1009,26 @@ def _build_structure_tree(pdf: pikepdf.Pdf, all_page_elems: list,
                 })
 
             elem = pdf.make_indirect(pikepdf.Dictionary(elem_dict))
-            page_elem_refs.append(elem)
-            all_leaf_elems.append((elem, struct_type))
+            # table_id is page-local; make it document-unique so tables on
+            # different pages (or a table continued across a page break) don't
+            # merge into one and collide on (row, col).
+            _tid = g.get("table_id")
+            _tkey = (page_idx, _tid) if _tid is not None else None
+            all_leaf_elems.append((
+                elem, struct_type, _tkey,
+                g.get("table_row"), g.get("table_col"),
+            ))
+            for m in g["mcids"]:
+                mcid_to_elem[m] = elem
 
-            if struct_type == "/Link" and annot_obj is not None:
-                annot_parent_entries.append((annot_obj, elem))
+            if struct_type == "/Link" and g["annot"] is not None:
+                annot_parent_entries.append((g["annot"], elem))
 
+        # Dense MCID-indexed array (0..max). Every page MCID has an owner.
+        max_mcid = max(mcid_to_elem) if mcid_to_elem else -1
+        page_elem_refs = [
+            mcid_to_elem.get(m, doc_elem) for m in range(max_mcid + 1)
+        ]
         parent_tree_nums.append(page_idx)
         parent_tree_nums.append(pikepdf.Array(page_elem_refs))
 
@@ -978,8 +1099,30 @@ def _group_and_add_children(pdf: pikepdf.Pdf, doc_elem, doc_kids,
             l_kids.append(item_elem)
         doc_kids.append(l_elem)
 
-    def _flush_table(cells):
-        """Wrap accumulated /TD|/TH elements in /Table -> /TR."""
+    def _empty_cell(struct_type, parent):
+        """A structurally-present but content-less table cell, used to pad a
+        short row so every row has the same column count (PDF/UA 7.2)."""
+        d = {
+            "/Type": pikepdf.Name("/StructElem"),
+            "/S": pikepdf.Name(struct_type),
+            "/P": parent,
+            "/K": pikepdf.Array(),
+        }
+        if struct_type == "/TH":
+            d["/A"] = pikepdf.Dictionary({
+                "/O": pikepdf.Name("/Table"),
+                "/Scope": pikepdf.Name("/Column"),
+            })
+        return pdf.make_indirect(pikepdf.Dictionary(d))
+
+    def _flush_one_table(cells):
+        """Build /Table -> /TR (per row) -> /TH|/TD for one table.
+
+        `cells` is a list of (elem, struct_type, row, col) in document order.
+        Rows are padded to the table's column count so every row is equal
+        width (PDF/UA 7.2), and a header row emits /TH with a column scope.
+        """
+        n_cols = max((c[3] for c in cells if c[3] is not None), default=-1) + 1
         table_kids = pikepdf.Array()
         table_elem = pdf.make_indirect(pikepdf.Dictionary({
             "/Type": pikepdf.Name("/StructElem"),
@@ -988,22 +1131,61 @@ def _group_and_add_children(pdf: pikepdf.Pdf, doc_elem, doc_kids,
             "/K": table_kids,
         }))
 
-        # Group cells into rows. Since we process sequentially, we create
-        # one /TR per consecutive group. Each cell becomes a child of /TR.
-        tr_kids = pikepdf.Array()
-        tr_elem = pdf.make_indirect(pikepdf.Dictionary({
-            "/Type": pikepdf.Name("/StructElem"),
-            "/S": pikepdf.Name("/TR"),
-            "/P": table_elem,
-            "/K": tr_kids,
-        }))
+        # Bucket cells by row (preserving first-seen row order).
+        row_order = []
+        by_row = {}
+        for cell_elem, cstype, row, col in cells:
+            if row not in by_row:
+                by_row[row] = {}
+                row_order.append(row)
+            by_row[row][col if col is not None else len(by_row[row])] = \
+                (cell_elem, cstype)
 
-        for cell_elem in cells:
-            cell_elem[pikepdf.Name("/P")] = tr_elem
-            tr_kids.append(cell_elem)
+        for r_i, row in enumerate(row_order):
+            tr_kids = pikepdf.Array()
+            tr_elem = pdf.make_indirect(pikepdf.Dictionary({
+                "/Type": pikepdf.Name("/StructElem"),
+                "/S": pikepdf.Name("/TR"),
+                "/P": table_elem,
+                "/K": tr_kids,
+            }))
+            table_kids.append(tr_elem)
+            row_cells = by_row[row]
+            is_header_row = any(
+                cs == "/TH" for _, cs in row_cells.values()
+            )
+            for c in range(max(n_cols, max(row_cells) + 1 if row_cells else 0)):
+                if c in row_cells:
+                    cell_elem, cstype = row_cells[c]
+                    if cstype == "/TH":
+                        cell_elem[pikepdf.Name("/A")] = pikepdf.Dictionary({
+                            "/O": pikepdf.Name("/Table"),
+                            "/Scope": pikepdf.Name("/Column"),
+                        })
+                    cell_elem[pikepdf.Name("/P")] = tr_elem
+                    tr_kids.append(cell_elem)
+                else:
+                    # Pad missing column with an empty cell of the row's type.
+                    tr_kids.append(_empty_cell(
+                        "/TH" if is_header_row else "/TD", tr_elem))
 
-        table_kids.append(tr_elem)
         doc_kids.append(table_elem)
+
+    def _flush_table(cells):
+        """Split accumulated cells into separate tables by table id, then
+        build each. `cells` is (elem, struct_type, table_id, row, col)."""
+        if not cells:
+            return
+        run = []
+        cur_tid = cells[0][2]
+        for elem, cstype, tid, row, col in cells:
+            if tid != cur_tid and run:
+                _flush_one_table(run)
+                run = []
+                cur_tid = tid
+            run.append((elem, cstype, row, col))
+        if run:
+            _flush_one_table(run)
 
     def _wrap_in_p(child_elem):
         """Wrap a single inline element in a /P block under /Document."""
@@ -1029,7 +1211,11 @@ def _group_and_add_children(pdf: pikepdf.Pdf, doc_elem, doc_kids,
             _flush_table(pending_table)
             pending_table.clear()
 
-    for elem, struct_type in all_leaf_elems:
+    for leaf in all_leaf_elems:
+        elem, struct_type = leaf[0], leaf[1]
+        table_id = leaf[2] if len(leaf) > 2 else None
+        table_row = leaf[3] if len(leaf) > 3 else None
+        table_col = leaf[4] if len(leaf) > 4 else None
         if struct_type in _NEEDS_LIST:
             if pending_table:
                 _flush_table(pending_table)
@@ -1039,7 +1225,8 @@ def _group_and_add_children(pdf: pikepdf.Pdf, doc_elem, doc_kids,
             if pending_list:
                 _flush_list(pending_list)
                 pending_list.clear()
-            pending_table.append(elem)
+            pending_table.append(
+                (elem, struct_type, table_id, table_row, table_col))
         elif struct_type in _NEEDS_P_WRAP:
             # Inline element — flush pending groups, then wrap in /P
             _flush_pending()
