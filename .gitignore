@@ -36,3 +36,6 @@ Thumbs.db
 GUIDE.md
 GUIDE.pdf
 make_guide_pdf.py
+
+# Generated docs output — regenerate with generate_docx.py
+TEAM_DOCUMENTATION.docx
