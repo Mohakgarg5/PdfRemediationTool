@@ -54,6 +54,11 @@ class TextBlock:
     heading_level: Optional[int] = None
     rotation_degrees: float = 0.0
     page_number: int = 0
+    # Per-word horizontal extents as (x0, x1, text). pdfminer groups characters
+    # into blocks without regard to table cell boundaries, so two adjacent
+    # column headers sharing a baseline can arrive as one block; word extents
+    # let such a block be split back onto the correct columns.
+    words: list = field(default_factory=list)
 
 
 @dataclass

@@ -164,6 +164,7 @@ def _process_layout_element(element, page_content: PageContent, page_num: int):
                 font=font_info,
                 rotation_degrees=rotation,
                 page_number=page_num,
+                words=_words_from_lines([lo for _, _, lo in line_infos]),
             )
             page_content.text_blocks.append(text_block)
 
@@ -190,6 +191,69 @@ def _process_layout_element(element, page_content: PageContent, page_num: int):
                 page_content.fill_rects.append(
                     BBox(element.x0, element.y0, element.x1, element.y1)
                 )
+
+
+def _words_from_chars(chars: list) -> list:
+    """Group a single line's LTChars into (x0, x1, text) words.
+
+    Pass chars from ONE line only — a word must never span lines, or its x
+    extent becomes meaningless for column matching. Splits on whitespace and on
+    any unusually large horizontal gap, since pdfminer represents inter-word
+    space inconsistently (sometimes an LTChar, sometimes an LTAnno that has
+    already been filtered out). Over-splitting is harmless here: each fragment
+    still lands in the correct column.
+    """
+    words: list = []
+
+    def _flush(cs):
+        if cs:
+            words.append((
+                min(c.x0 for c in cs),
+                max(c.x1 for c in cs),
+                "".join(c.get_text() for c in cs),
+            ))
+
+    cur: list = []
+    for ch in chars:
+        t = ch.get_text()
+        if not t or not t.strip():
+            _flush(cur); cur = []
+            continue
+        if cur:
+            gap = ch.x0 - cur[-1].x1
+            if gap > max(1.0, getattr(ch, "size", 10.0) * 0.3):
+                _flush(cur); cur = []
+        cur.append(ch)
+    _flush(cur)
+    return words
+
+
+def _words_from_lines(lines: list) -> list:
+    """Word extents for a group of LTTextLine objects, built line by line."""
+    words: list = []
+    for line in lines:
+        words.extend(_words_from_chars(
+            [c for c in line if isinstance(c, LTChar)]
+        ))
+    return words
+
+
+def _glue_words(wa: list, wb: list) -> list:
+    """Concatenate two word lists the way _merge_split_blocks joins their text.
+
+    The texts are joined without a separator (drop-cap fragments such as
+    'P' + 'ublicly'), so the boundary words merge into one rather than staying
+    separate — otherwise a split would reintroduce the space.
+    """
+    if not wa:
+        return list(wb)
+    if not wb:
+        return list(wa)
+    ax0, ax1, at = wa[-1]
+    bx0, bx1, bt = wb[0]
+    return (list(wa[:-1])
+            + [(min(ax0, bx0), max(ax1, bx1), at + bt)]
+            + list(wb[1:]))
 
 
 def _split_text_box_by_lines(line_infos, line_sizes, page_content, page_num):
@@ -239,6 +303,7 @@ def _split_text_box_by_lines(line_infos, line_sizes, page_content, page_num):
             font=font_info,
             rotation_degrees=rotation,
             page_number=page_num,
+            words=_words_from_lines(lines),
         )
         page_content.text_blocks.append(text_block)
 
@@ -325,6 +390,7 @@ def _merge_split_blocks(text_blocks: list) -> list:
                 font=long_b.font,
                 rotation_degrees=long_b.rotation_degrees,
                 page_number=long_b.page_number,
+                words=_glue_words(short_b.words, long_b.words),
             )
             merged.append(merged_block)
             used.add(short_idx)
@@ -834,32 +900,80 @@ def _build_table_from_rows(page, seg_rows, body_font_size, COL_TOL):
         ) and tb.text.strip()
     ]
 
+    def _own_col(x_center, cols):
+        """The ONE column that owns x_center: containing rect wins, else the
+        nearest rect within COL_TOL.
+
+        Deliberately exclusive. Testing each column independently against
+        rect +/- COL_TOL makes adjacent columns' acceptance windows overlap by
+        2*COL_TOL, so a block centered in that overlap gets claimed twice and
+        the same text is emitted for two cells.
+        """
+        best, best_d = -1, None
+        for ci, rect in cols.items():
+            if rect[0] <= x_center <= rect[2]:
+                return ci
+            d = rect[0] - x_center if x_center < rect[0] else x_center - rect[2]
+            if d <= COL_TOL and (best_d is None or d < best_d):
+                best, best_d = ci, d
+        return best
+
     cells = []; used = []
     n_rows = len(grid_rows)
+    ordered = sorted(text_candidates, key=lambda b: (-b.bbox.y1, b.bbox.x0))
+
     for r_idx, (ry0, ry1, cols) in enumerate(grid_rows):
-        for c_idx in range(col_count):
-            rect = cols.get(c_idx)
-            if rect is None:
+        pieces: dict = {}   # col -> [text, ...] in reading order
+        xs: dict = {}       # col -> [(x0, x1), ...]
+        ys: dict = {}       # col -> [(y0, y1), ...]
+
+        for tb in ordered:
+            cy = (tb.bbox.y0 + tb.bbox.y1) / 2
+
+            # Split only when the block's own words genuinely fall in more than
+            # one column; otherwise keep it whole so ordinary cells (and blocks
+            # with no word data) behave exactly as before.
+            # Splitting is only safe when EVERY word lands in a column: the
+            # block is dropped from the page once consumed, so a word matching
+            # no column would be lost from the document altogether. Fall back to
+            # whole-block assignment in that case, which is lossless.
+            mapped: list = []
+            if tb.words:
+                by_word = [(_own_col((w[0] + w[1]) / 2, cols), w) for w in tb.words]
+                if (all(c >= 0 for c, _ in by_word)
+                        and len({c for c, _ in by_word}) > 1):
+                    mapped = [(c, w[0], w[1], w[2]) for c, w in by_word]
+            if not mapped:
+                c = _own_col((tb.bbox.x0 + tb.bbox.x1) / 2, cols)
+                if c < 0:
+                    continue
+                mapped = [(c, tb.bbox.x0, tb.bbox.x1, " ".join(tb.text.split()))]
+
+            hit = False
+            for c, wx0, wx1, wtext in mapped:
+                rect = cols[c]
+                if not (rect[1] - 2 <= cy <= rect[3] + 2):
+                    continue
+                wtext = " ".join(wtext.split())
+                if not wtext:
+                    continue
+                pieces.setdefault(c, []).append(wtext)
+                xs.setdefault(c, []).append((wx0, wx1))
+                ys.setdefault(c, []).append((tb.bbox.y0, tb.bbox.y1))
+                hit = True
+            if hit:
+                used.append(tb)
+
+        for c_idx in sorted(pieces):
+            text = " ".join(pieces[c_idx])
+            if not text.strip():
                 continue
-            inside = [
-                tb for tb in text_candidates
-                if (rect[0] - COL_TOL <= (tb.bbox.x0 + tb.bbox.x1) / 2
-                    <= rect[2] + COL_TOL)
-                and (rect[1] - 2 <= (tb.bbox.y0 + tb.bbox.y1) / 2 <= rect[3] + 2)
-            ]
-            if not inside:
-                continue
-            inside.sort(key=lambda b: (-b.bbox.y1, b.bbox.x0))
-            text = " ".join(" ".join(b.text.split()) for b in inside)
             cb = BBox(
-                x0=min(b.bbox.x0 for b in inside),
-                y0=min(b.bbox.y0 for b in inside),
-                x1=max(b.bbox.x1 for b in inside),
-                y1=max(b.bbox.y1 for b in inside),
+                x0=min(a for a, _ in xs[c_idx]), y0=min(a for a, _ in ys[c_idx]),
+                x1=max(b for _, b in xs[c_idx]), y1=max(b for _, b in ys[c_idx]),
             )
             cells.append(TableCell(text=text, bbox=cb, row=r_idx, col=c_idx,
                                    is_header=(r_idx == 0)))
-            used.extend(inside)
 
     if len({c.row for c in cells}) < 2 or not used:
         return
