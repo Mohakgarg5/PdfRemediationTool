@@ -869,9 +869,11 @@ def _build_structure_tree(pdf: pikepdf.Pdf, all_page_elems: list,
     - All other types (/P, /H1-/H6, /Figure, etc.) go directly under /Document
     """
     _heading_re = re.compile(r'^/H(\d+)$')
-    # Only block-level text flows are collapsed. /LI, /TD, /TH, /Figure, /Link,
-    # /Span keep their 1:1 mapping so list/table/link/figure handling is intact.
-    _MERGEABLE_NONHEAD = frozenset(["/P"])
+    # Only block-level text flows are collapsed: each extracted block is one
+    # paragraph or one list item, so its runs (one per line, plus the bullet
+    # glyph's own font run) belong to a single /P or /LI. /TD, /TH, /Figure,
+    # /Link, /Span keep their 1:1 mapping so table/link/figure handling is intact.
+    _MERGEABLE_NONHEAD = frozenset(["/P", "/LI"])
 
     # -- Pass 1: collapse marked-content runs into logical elements ----------
     # Consecutive runs sharing a group id and struct type belong to one visual
@@ -915,8 +917,8 @@ def _build_structure_tree(pdf: pikepdf.Pdf, all_page_elems: list,
                 groups.append(g)
                 continue
 
-            # /P and /H* collapse per group so a wrapped multi-line
-            # paragraph/heading becomes ONE element.
+            # /P, /LI and /H* collapse per group so a wrapped multi-line
+            # paragraph/item/heading becomes ONE element.
             mergeable = gid is not None and (
                 bool(_heading_re.match(struct_type))
                 or struct_type in _MERGEABLE_NONHEAD

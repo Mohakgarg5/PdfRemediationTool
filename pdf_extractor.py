@@ -62,6 +62,10 @@ def extract_document(pdf_path: str) -> DocumentContent:
     for page in raw_pages:
         _classify_elements(page, body_font_size, hf_signatures)
 
+    # Phase 6b: Re-attach wrapped list-item lines pdfminer split into their own box
+    for page in raw_pages:
+        page.text_blocks = _merge_list_continuations(page.text_blocks)
+
     # Phase 7: Normalize heading hierarchy (start at H1, no skipped levels)
     _normalize_heading_hierarchy(raw_pages)
 
@@ -149,8 +153,10 @@ def _process_layout_element(element, page_content: PageContent, page_num: int):
         min_size = min(line_sizes) if line_sizes else 1.0
         if min_size < 1.0:
             min_size = 1.0
-        if line_sizes and max(line_sizes) / min_size > 1.3:
-            _split_text_box_by_lines(line_infos, line_sizes, page_content, page_num)
+        split_sizes = bool(line_sizes) and max(line_sizes) / min_size > 1.3
+        groups = _line_groups(line_infos, line_sizes, split_sizes)
+        if len(groups) > 1:
+            _split_text_box_by_lines(line_infos, groups, page_content, page_num)
         else:
             # All lines similar size — create one block
             all_chars = [c for _, chars, _ in line_infos for c in chars]
@@ -256,35 +262,81 @@ def _glue_words(wa: list, wb: list) -> list:
             + list(wb[1:]))
 
 
-def _split_text_box_by_lines(line_infos, line_sizes, page_content, page_num):
-    """Split a text box into separate blocks when lines have different font sizes.
+_BULLET_GLYPHS = (
+    "•‣⁃▪▫▸▹○●◦∙"
+    ""
+)
 
-    Groups consecutive lines with similar sizes together.
+
+def _starts_with_bullet_glyph(text: str) -> bool:
+    t = text.lstrip()
+    return len(t) > 1 and t[0] in _BULLET_GLYPHS
+
+
+def _is_bold_line(chars: list) -> bool:
+    """True when every non-space character on the line is in a bold face."""
+    glyphs = [c for c in chars if c.get_text().strip()]
+    return bool(glyphs) and all(
+        any(kw in (c.fontname or "").lower()
+            for kw in ("bold", "black", "heavy", "demi"))
+        for c in glyphs
+    )
+
+
+def _line_groups(line_infos, line_sizes, split_sizes: bool) -> list:
+    """Partition a text box's lines into groups that are separate blocks.
+
+    pdfminer packs vertically adjacent lines into one box regardless of
+    structure, so a bold run-in label and the list under it ("Keep totals
+    accurate" + "• Numbers only…"), or several bullets in a row, arrive as a
+    single paragraph and are never tagged as a heading or list (WCAG 1.3.1).
+    A new group starts at:
+      - a font-size change (only when split_sizes, i.e. the box mixes sizes),
+      - a line that opens with a list marker,
+      - the line after a lone bold label line, when that line is not bold.
+    Returns a list of lists of line indices.
     """
     SIZE_TOLERANCE = 1.5  # lines within this pt difference are grouped
 
-    groups = []  # list of (texts, chars, line_objs)
-    current_group_texts = []
-    current_group_chars = []
-    current_group_lines = []
-    current_group_size = line_sizes[0]
-
-    for i, (text, chars, line_obj) in enumerate(line_infos):
-        size = line_sizes[i]
-        if abs(size - current_group_size) <= SIZE_TOLERANCE:
-            current_group_texts.append(text)
-            current_group_chars.extend(chars)
-            current_group_lines.append(line_obj)
+    box_width = max(lo.x1 for _, _, lo in line_infos) - min(lo.x0 for _, _, lo in line_infos)
+    in_list = _is_list_item(line_infos[0][0])
+    groups = [[0]]
+    group_size = line_sizes[0]
+    for i in range(1, len(line_infos)):
+        text, chars, line_obj = line_infos[i]
+        new_group = False
+        if split_sizes and abs(line_sizes[i] - group_size) > SIZE_TOLERANCE:
+            new_group = True
+        elif _starts_with_bullet_glyph(text) or (in_list and _is_list_item(text)):
+            # Dashes and "2)" can begin a wrapped prose line, so a bare marker
+            # only splits once the box is already known to be a list.
+            new_group = True
+        elif len(groups[-1]) == 1:
+            p_text, p_chars, p_line = line_infos[groups[-1][0]]
+            # A label is a short bold line that stops well short of the
+            # text measure, followed by regular-weight text.
+            if (_is_bold_line(p_chars) and not _is_bold_line(chars)
+                    and p_line.x1 - p_line.x0 < box_width * 0.75
+                    and not _is_list_item(p_text)
+                    and _looks_like_heading_text(p_text)):
+                new_group = True
+        if new_group:
+            groups.append([i])
+            group_size = line_sizes[i]
         else:
-            if current_group_texts:
-                groups.append((current_group_texts, current_group_chars, current_group_lines))
-            current_group_texts = [text]
-            current_group_chars = list(chars)
-            current_group_lines = [line_obj]
-            current_group_size = size
+            groups[-1].append(i)
+    return groups
 
-    if current_group_texts:
-        groups.append((current_group_texts, current_group_chars, current_group_lines))
+
+def _split_text_box_by_lines(line_infos, line_groups, page_content, page_num):
+    """Emit one text block per group of line indices from _line_groups."""
+    groups = []  # list of (texts, chars, line_objs)
+    for idxs in line_groups:
+        groups.append((
+            [line_infos[i][0] for i in idxs],
+            [c for i in idxs for c in line_infos[i][1]],
+            [line_infos[i][2] for i in idxs],
+        ))
 
     for texts, chars, lines in groups:
         full_text = "\n".join(texts)
@@ -483,7 +535,10 @@ def _is_list_item(text: str) -> bool:
         _LIST_ITEM_RE = re.compile(
             r'^\s*(?:'
             r'[\u2022\u2023\u2043\u25aa\u25ab\u25b8\u25b9\u25cb\u25cf\u25e6\u2013\u2014\u2219\u00b7]'  # bullet chars
-            r'|[-*\u2010\u2011]'       # dash/asterisk bullets
+            # Symbol/Wingdings bullets in the private-use area (Word bullets
+            # exported by LibreOffice keep their raw Symbol code points)
+            r'|[\uf0b7\uf0a7\uf0a8\uf0d8\uf076\uf0fc\uf06e\uf0e0]'
+            r'|[-*\u2010\u2011](?=\s)'  # dash/asterisk bullets (not "-70")
             r'|\d{1,3}[.)]\s'          # numbered: 1. 2) 10.
             r'|[a-zA-Z][.)]\s'         # lettered: a. b) A.
             r'|[ivxIVX]{1,4}[.)]\s'    # roman: i. ii) IV.
@@ -746,6 +801,39 @@ def _classify_elements(page: PageContent, body_font_size: float, hf_signatures: 
         if tb.element_type == ElementType.HEADING and (in_header or in_footer):
             tb.element_type = ElementType.PARAGRAPH
             tb.heading_level = None
+
+
+def _merge_list_continuations(text_blocks: list) -> list:
+    """Fold a list item's wrapped lines back into the item.
+
+    With a hanging indent the continuation lines sit right of the bullet, and
+    pdfminer often boxes them separately, leaving half the item as a stray
+    /P after its /LI. A paragraph is a continuation when it directly follows
+    a list item, starts indented past the bullet (but not by a whole level),
+    and sits within one line gap below it.
+    """
+    merged: list = []
+    for tb in text_blocks:
+        prev = merged[-1] if merged else None
+        if (prev is not None
+                and prev.element_type == ElementType.LIST_ITEM
+                and tb.element_type == ElementType.PARAGRAPH
+                and prev.page_number == tb.page_number
+                and 3.0 < tb.bbox.x0 - prev.bbox.x0 <= 40.0
+                and 0 <= prev.bbox.y0 - tb.bbox.y1 < tb.font.size * 0.6):
+            merged[-1] = TextBlock(
+                text=prev.text + "\n" + tb.text,
+                bbox=BBox(min(prev.bbox.x0, tb.bbox.x0), tb.bbox.y0,
+                          max(prev.bbox.x1, tb.bbox.x1), prev.bbox.y1),
+                font=prev.font,
+                element_type=ElementType.LIST_ITEM,
+                rotation_degrees=prev.rotation_degrees,
+                page_number=prev.page_number,
+                words=prev.words + tb.words,
+            )
+            continue
+        merged.append(tb)
+    return merged
 
 
 def _normalize_heading_hierarchy(pages: list):
